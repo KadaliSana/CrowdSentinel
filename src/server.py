@@ -193,22 +193,7 @@ def count_feed():
 # --- Frontend Template ---
 @app.route('/')
 def index():
-    return render_template_string("""
-        <html>
-            <body style="font-family: sans-serif; text-align: center; background: #222; color: #fff;">
-                <h1>Zero-Lag Monitor</h1>
-                <img src="/video_feed" style="width: 80%; border: 2px solid #555;"/><br/>
-                <h2 style="font-size: 50px; color: #0f0;">
-                    People: <span id="cnt">0</span>
-                </h2>
-                <script>
-                    new EventSource("/count_feed").onmessage = (e) => {
-                        document.getElementById("cnt").innerText = e.data;
-                    };
-                </script>
-            </body>
-        </html>
-    """)
+    return render_template('index.html')
 
 if __name__ == "__main__":
     app.run(host='0.0.0.0', port=5000, threaded=True)
