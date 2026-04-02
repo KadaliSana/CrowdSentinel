@@ -118,5 +118,3 @@ Yan/
 
 4. **Access Dashboard**:
    Open [http://localhost:5000](http://localhost:5000) in your modern browser.
-
-*Developed for the Yantra Competition.*
