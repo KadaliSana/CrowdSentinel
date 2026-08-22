@@ -14,6 +14,14 @@ models/acuity/
 # defensive: live-looking AWS key lives here if firmware_rtsp is ever tracked
 src/firmware_rtsp/component/example/kvs_producer_mmf/sample_config.h
 
+# backup config files can carry the same live credentials as demo_config.h
+*.bak
+
+# compiled firmware images can have credentials baked in from demo_config.h
+flash/Pro2_PG_tool_v1.4.3/flash_ntz.bin
+flash/Pro2_PG_tool_v1.4.3/known_good_1626.nn.bin
+flash/reference/
+
 # python build artifacts (regenerable)
 venv/
 .venv/
