@@ -163,8 +163,12 @@ preceded by a VOE dump full of `A5A5A5A5`, then `[VID Err]Please check sensor id
 The NN then looks broken because it never receives a frame.
 
 `MEDIA_PORT_NN_WIDTH/_HEIGHT` must be a size the ISP actually accepts. **576x320 is the only size
-observed working on this board**; 416x416 and 640x640 both killed VOE. The constraint is empirical,
-hence the whitelist assert rather than a formula — a new size must be tested on device.
+observed working on this board**; 416x416 and 640x640 both killed VOE. The constraint is empirical
+(all three are multiples of 16, so there is no formula to check) — hence the whitelist assert. A new
+size must be tested on device.
+
+Confirmed working at 576x320: VOE opens, `Deploy SCRFD` completes, and the H.264 stream reaches AWS
+KVS WebRTC end to end.
 
 Ruled out by partition-diffing flash images (don't re-test these): `voe.bin` is byte-identical
 everywhere; the `fcsdata` partition is identical; the `iq` partition differs only by a 3-byte build
