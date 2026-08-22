@@ -2218,6 +2218,11 @@ int nor_pfw_tell(void *fr)
 }
 
 /* src dst len should align to 32byte*/
+/* MUST be naked+noinline: the asm below supplies its own prologue/epilogue and
+ * returns with `bx lr`. Without naked GCC adds a prologue this asm never undoes,
+ * and without noinline GCC inlines the body into the caller, where that `bx lr`
+ * returns from the *caller* instead - hijacking its return address. */
+__attribute__((naked, noinline))
 void memcpy32(void *dst, void *src, int len)
 {
 	__asm(
@@ -2243,11 +2248,12 @@ static void nor_copy_read(void *dst, void *src, int len)
 	if ((phal_spic_adaptor->flash_id[2]) >= FLASH_ID_4ADDR) {
 		hal_flash_enter_4byte_addr(phal_spic_adaptor);
 	}
-	if ((uint32_t)dst % 32 == 0 && (uint32_t)src % 32 == 0 && len % 32 == 0) {
-		memcpy32(dst, src, len);
-	} else {
-		memcpy(dst, src, len);
-	}
+	/* memcpy32() fast path removed: it hard-faulted whenever dst/src/len were all
+	 * 32-byte aligned (e.g. a model whose size is a multiple of 32). Its inline asm
+	 * was inlined into this function and its `bx lr` hijacked the caller's return,
+	 * skipping the mutex unlock and the 4-byte-addr exit below. Plain memcpy costs
+	 * a few ms on the one caller (model load at boot) and is always correct. */
+	memcpy(dst, src, len);
 	if ((phal_spic_adaptor->flash_id[2]) >= FLASH_ID_4ADDR) {
 		hal_flash_exit_4byte_addr(phal_spic_adaptor);
 	}

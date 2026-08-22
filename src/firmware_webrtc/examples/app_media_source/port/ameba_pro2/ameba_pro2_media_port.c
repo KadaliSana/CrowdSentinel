@@ -36,9 +36,70 @@
 
 #if defined( ENABLE_NN_OBJECT_DETECTION ) && ( ENABLE_NN_OBJECT_DETECTION == 1 )
 #include "module_vipnn.h"
-#include "model_nanodet.h"
 #include "nn_utils/class_name.h"
 #include "osd_render.h"
+
+/* Compile-time assert that works under -std=gnu99 (no _Static_assert). */
+#define MEDIA_PORT_ASSERT_CONCAT_( a, b ) a##b
+#define MEDIA_PORT_ASSERT_CONCAT( a, b )  MEDIA_PORT_ASSERT_CONCAT_( a, b )
+#define MEDIA_PORT_STATIC_ASSERT( cond ) \
+    typedef char MEDIA_PORT_ASSERT_CONCAT( media_port_static_assert_, __LINE__ )[ ( cond ) ? 1 : -1 ]
+
+/*=============================================================================
+ * NN MODEL SELECTION - SINGLE SOURCE OF TRUTH
+ *
+ * Swapping the NN model means keeping FOUR separate things in sync. They live in
+ * three different files, they have drifted apart before, and each mismatch fails
+ * in a way that does NOT point at the real cause:
+ *
+ *   (1) MEDIA_PORT_NN_MODEL      - here; the nnmodel_t passed to CMD_VIPNN_SET_MODEL
+ *   (2) scenario.cmake           - which model_*.c decoder gets compiled
+ *   (3) amebapro2_fwfs_nn_models.json -> FWFS.files - which .nb is packed into the
+ *                                  image. NOTE: it is hardcoded there; the
+ *                                  auto_model_cfg step does NOT rewrite it.
+ *   (4) MEDIA_PORT_NN_WIDTH/HEIGHT - the ISP RGB channel that feeds the NPU
+ *
+ * Failure modes actually observed on this board:
+ *   (3) wrong -> the .nb is absent, vipnn cannot open it, deploy fails.
+ *   (2) not matching (1) -> the model loads but the decoder misparses its
+ *       tensors and you get plausible-looking garbage boxes.
+ *   (4) wrong -> "VOE cmd 0x206 ACK timeout" / "VOE_OPEN_CMD command fail" /
+ *       "hal_video_open fail", i.e. NO VIDEO AT ALL, and the NN then looks
+ *       broken because it never receives a frame. 576x320 is the only size
+ *       this board has been observed to accept; 416x416 and 640x640 both
+ *       killed VOE. This is why the guard below is a whitelist, not a formula
+ *       - the constraint is empirical, so a new size MUST be tested on device.
+ *
+ * Also required: the model .nb must load through fwfs. A .nb whose size is an
+ * exact multiple of 32 used to hard-fault on load (Usage Fault, UNALIGNED).
+ * That was a real SDK defect - see the memcpy32 comment in
+ * component/file_system/fwfs/fwfs.c. Preserve that patch across SDK updates;
+ * without it, any 32-byte-aligned model brings the board down at deploy time.
+ *
+ * Define exactly ONE MEDIA_PORT_NN_MODEL_* below.
+ *===========================================================================*/
+#define MEDIA_PORT_NN_MODEL_SCRFD 1
+
+#if defined( MEDIA_PORT_NN_MODEL_SCRFD ) && ( MEDIA_PORT_NN_MODEL_SCRFD == 1 )
+    #include "model_scrfd.h"
+    #define MEDIA_PORT_NN_MODEL      scrfd_fwfs      /* (1) */
+    #define MEDIA_PORT_NN_DECODER_C  "model_scrfd.c" /* (2) keep scenario.cmake in step */
+    #define MEDIA_PORT_NN_FWFS_ENTRY "scrfd320p"     /* (3) keep FWFS.files in step */
+    #define MEDIA_PORT_NN_WIDTH      576             /* (4) tested-good ISP size */
+    #define MEDIA_PORT_NN_HEIGHT     320
+    /* SCRFD returns facedetect_res_t (= objdetect_res_t + landmark_t). It is the
+       LARGER struct, so CMD_VIPNN_SET_RES_SIZE and the callback cast must both
+       use this typedef, or pRes[i] strides wrong for every result after the
+       first and every box but one lands in the wrong place. */
+    typedef facedetect_res_t media_port_nn_res_t;
+#else
+    #error "Define exactly one MEDIA_PORT_NN_MODEL_* (see the block above)."
+#endif
+
+/* Empirical whitelist - see (4) above. Changing the NN channel size without
+   testing reproduces the silent "no video" VOE failure, so this deliberately
+   breaks the build instead of the board. */
+MEDIA_PORT_STATIC_ASSERT( ( MEDIA_PORT_NN_WIDTH == 576 ) && ( MEDIA_PORT_NN_HEIGHT == 320 ) );
 
 #define LIMIT(x, lower, upper) if(x<lower) x=lower; else if(x>upper) x=upper;
 #endif /* ENABLE_NN_OBJECT_DETECTION */
@@ -142,8 +203,9 @@ static video_params_t videoParams = {
 * Video type  : RGB -> NPU (YOLO26 object detection)
 *****************************************************************************/
 #define MEDIA_PORT_NN_CHANNEL 4
-#define MEDIA_PORT_NN_WIDTH   416   /* must match the model input size */
-#define MEDIA_PORT_NN_HEIGHT  416
+/* MEDIA_PORT_NN_WIDTH / _HEIGHT come from the model-selection block near the top
+   of this file - do not redefine them here, that is how they drifted out of sync
+   with the packed model before. */
 #define MEDIA_PORT_NN_FPS     15
 
 #define MEDIA_PORT_SENSOR_MAX_WIDTH  1920
@@ -197,7 +259,9 @@ static void NnDetectionResultCallback( void * p,
                                        void * img_param )
 {
     vipnn_out_buf_t * pOut = ( vipnn_out_buf_t * ) p;
-    objdetect_res_t * pRes;
+    /* Result type comes from the model-selection block; see the note there on
+       why using the wrong struct mis-strides every result after the first. */
+    media_port_nn_res_t * pRes;
     int i;
 
     if( ( p == NULL ) || ( img_param == NULL ) )
@@ -205,7 +269,7 @@ static void NnDetectionResultCallback( void * p,
         return;
     }
 
-    pRes = ( objdetect_res_t * ) &( pOut->res[ 0 ] );
+    pRes = ( media_port_nn_res_t * ) &( pOut->res[ 0 ] );
 
     canvas_create_bitmap( MEDIA_PORT_V1_CHANNEL, 0, RTS_OSD2_BLK_FMT_1BPP );
 
@@ -215,7 +279,7 @@ static void NnDetectionResultCallback( void * p,
         static int diagFrame = 0;
         if( ( diagFrame++ % 30 ) == 0 )
         {
-            const char * dbg = "NanoDet_plus_m 416x416";
+            const char * dbg = "SCRFD 576x320";
             if( pOut->res_cnt > 0 )
             {
                 int wmin = 9999, wmax = -9999, hmin = 9999, hmax = -9999, d;
@@ -240,12 +304,12 @@ static void NnDetectionResultCallback( void * p,
 
     if( pOut->res_cnt > 0 )
     {
-        LogInfo( ( "[YOLO26] object num = %d", pOut->res_cnt ) );
+        LogInfo( ( "[SCRFD] face num = %d", pOut->res_cnt ) );
 
         for( i = 0; i < pOut->res_cnt; i++ )
         {
             int classId = ( int ) pRes[ i ].result[ 0 ];
-            /* COCO class 0 == person; ignore the other 79 classes */
+            /* SCRFD is single-class: it writes result[0] == 0 for every face */
             if( classId == 0 )
             {
                 int im_w = MEDIA_PORT_V1_WIDTH;
@@ -278,7 +342,7 @@ static void NnDetectionResultCallback( void * p,
                 LIMIT(ymin, 0, im_h);
                 LIMIT(ymax, 0, im_h);
 
-                LogInfo( ( "[YOLO26] %d: %s %d%% (%d,%d)-(%d,%d)",
+                LogInfo( ( "[SCRFD] %d: %s %d%% (%d,%d)-(%d,%d)",
                            i,
                            coco_name_get_by_id( classId ),
                            ( int ) ( pRes[ i ].result[ 1 ] * 100 ),
@@ -723,7 +787,7 @@ int32_t AppMediaSourcePort_Init( void )
         {
             mm_module_ctrl( pVipnnContext,
                             CMD_VIPNN_SET_MODEL,
-                            ( int ) &nanodet_plus_m );
+                            ( int ) &MEDIA_PORT_NN_MODEL );
             mm_module_ctrl( pVipnnContext,
                             CMD_VIPNN_SET_IN_PARAMS,
                             ( int ) &nnRoi );
@@ -738,7 +802,7 @@ int32_t AppMediaSourcePort_Init( void )
                             ( int ) &nnNmsThresh );
             mm_module_ctrl( pVipnnContext,
                             CMD_VIPNN_SET_RES_SIZE,
-                            sizeof( objdetect_res_t ) );
+                            sizeof( media_port_nn_res_t ) );
             mm_module_ctrl( pVipnnContext,
                             CMD_VIPNN_SET_RES_MAX_CNT,
                             MAX_DETECT_OBJ_NUM );

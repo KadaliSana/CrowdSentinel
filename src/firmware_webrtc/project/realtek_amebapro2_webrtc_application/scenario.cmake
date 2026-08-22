@@ -28,10 +28,10 @@ list(
     ${sdk_root}/component/video/osd2/osd_render.c
 )
 
-#NN MODEL + utils (object detection on NPU)
+#NN MODEL + utils (face detection on NPU)
 list(
     APPEND app_sources
-    ${sdk_prj_example_root}/src/test_model/model_nanodet.c
+    ${sdk_prj_example_root}/src/test_model/model_scrfd.c
     ${sdk_prj_example_root}/src/test_model/nn_utils/sigmoid.c
     ${sdk_prj_example_root}/src/test_model/nn_utils/quantize.c
     ${sdk_prj_example_root}/src/test_model/nn_utils/iou.c

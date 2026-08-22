@@ -101,15 +101,85 @@ These must be changed together or detection silently degrades:
 
 - **416** — `export_to_onnx.py --imgsz` must equal `NN_WIDTH`/`NN_HEIGHT` in
   `mmf2_video_example_vipnn_rtsp_init.c` (~L95) **and** `MEDIA_PORT_NN_WIDTH`/`_HEIGHT` in
-  `ameba_pro2_media_port.c:145`. Training `imgsz` (640) is independent of this.
+  `ameba_pro2_media_port.c` (now set in the NN MODEL SELECTION block near the top, not further down).
+  Training `imgsz` (640) is independent of this. Note the ISP constraint below: the NN channel size
+  is not free to match any model — see "wrong NN channel size kills VOE".
 - **opset 12** — the NPU's maximum; higher opsets fail Acuity import.
 - **`lid:` in `*_inputmeta.yml`** must match the input layer id in the generated `best.json`
   (`grep -o '"lid":"[^"]*"' best.json | head -1`).
 - **`"yolo26"` in `amebapro2_fwfs_nn_models.json`'s `FWFS.files`** — controls whether the `.nb` is
-  packed into the image at all. Present in each project's `GCC-RELEASE/build*/`.
+  packed into the image at all. The build **copies this file from
+  `libraries/ambpro2_sdk/project/realtek_amebapro2_v0_example/GCC-RELEASE/mp/`** over the one in
+  `build/` on every run (`CMakeLists.txt:142`), so edit the `mp/` copy — editing `build/` is lost.
+  `auto_model_cfg` does *not* rewrite `FWFS.files`; it is hardcoded there.
 
 `model_yolo26.c` auto-detects the head layout (E2E / CONCAT / SCALE / SPLIT); an "unsupported output
 layout" log usually means the ONNX export kept DFL layers.
+
+### WebRTC app: NN model selection is centralised
+
+`ameba_pro2_media_port.c` has a **NN MODEL SELECTION** block near the top that is the single source
+of truth for the four things that must agree (model struct, decoder `.c` in `scenario.cmake`,
+`FWFS.files` entry, and the ISP NN channel size). It ends in a compile-time whitelist assert on
+`MEDIA_PORT_NN_WIDTH/_HEIGHT`, so an untested channel size **breaks the build instead of the board**.
+Read that block before changing models — it records the failure mode of each mismatch.
+
+## Known defect: `memcpy32` hard-faults on 32-byte-aligned models
+
+**Symptom:** board resets right after `Deploy <model>` with `Usage Fault` /
+`SCB Configurable Fault Status Reg = 0x01000000` (UNALIGNED), and a stack-scan backtrace pointing
+into `fwfs.c`.
+
+**Cause:** `component/file_system/fwfs/fwfs.c` defined `memcpy32()` as an ordinary C function whose
+body is a bare `__asm` block ending in its own `pop {r0-r12}` + `bx lr`. GCC **inlined** it into
+`nor_copy_read()`/`nor_pfw_read()`, so that `bx lr` returned from the *caller*, skipping its epilogue,
+the `device_mutex_unlock`, the 4-byte-addr exit and `return size` — and branching through an `lr`
+already clobbered by `bl device_mutex_lock`.
+
+`nor_copy_read` only took that path when **dst, src and len were all 32-byte aligned**, so it
+depended on the model's file size:
+
+| `.nb` | size | `% 32` | result |
+|---|---|---|---|
+| `yolo26.nb` | 2868240 | 16 | safe `memcpy` — never hit the bug |
+| `nanodet_plus_m_416_uint8.nb` | 1959040 | 0 | hard fault |
+| `scrfd_500m_bnkps_576x320_u8.nb` | 583232 | 0 | hard fault |
+
+**Padding a `.nb` by 16 bytes only dodges the guard** and must be redone per model — it was the old
+workaround and it kept getting lost. The real fix (in the vendored SDK) drops the `memcpy32` fast
+path and marks the function `__attribute__((naked, noinline))`. Verify after any SDK refresh:
+
+```bash
+arm-none-eabi-objdump -d application/application.ntz.axf --disassemble=nor_pfw_read | grep -c 'bx\slr'
+# must print 0 — a bare `bx lr` means the defect is back
+```
+
+The same defect still exists **unpatched** in the `src/firmware_rtsp/` SDK copy.
+
+## Known defect: wrong NN channel size kills VOE (no video at all)
+
+**Symptom:** `VOE cmd 0x206 ACK timeout` → `VOE_OPEN_CMD command fail` → `hal_video_open fail`,
+preceded by a VOE dump full of `A5A5A5A5`, then `[VID Err]Please check sensor id first, the id is 2`.
+The NN then looks broken because it never receives a frame.
+
+`MEDIA_PORT_NN_WIDTH/_HEIGHT` must be a size the ISP actually accepts. **576x320 is the only size
+observed working on this board**; 416x416 and 640x640 both killed VOE. The constraint is empirical,
+hence the whitelist assert rather than a formula — a new size must be tested on device.
+
+Ruled out by partition-diffing flash images (don't re-test these): `voe.bin` is byte-identical
+everywhere; the `fcsdata` partition is identical; the `iq` partition differs only by a 3-byte build
+timestamp; and the forked `sensor.bin`/`sensor_f37.bin` were already present in the known-good image.
+"`the id is 2`" means `sensor_sets[2]` (= F37), **not** `SENSOR_GC2053` (`0x02` in `inc/sensor.h`) —
+the `IQ_OFFSET`/`SENSOR_OFFSET` values in the log settle it.
+
+Compare images partition-by-partition with the offsets from
+`GCC-RELEASE/build/amebapro2_partitiontable.json` (`fw1`=0x60000/0x400000, `iq`=0x460000/0xC0000,
+`nn`=0x920000/0x5E0000, `fcsdata`=0x8000/0x1000), stripping trailing `0xff`.
+
+Reference images: `flash/reference/known_good_1626.nn.bin` is the same WebRTC app built with yolo26
+and working VOE; `flash/Pro2_PG_tool_v1.4.3/flash_ntz.nn.bin` is the last image actually flashed.
+`/home/sana/Yan-backup/Yan/webrtc/` is a **full source tree** of an earlier working SCRFD build and is
+the fastest way to diff against a known-good configuration.
 
 ## Known defect: uint8 class-head quantization is too coarse
 
