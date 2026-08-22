@@ -1,0 +1,12 @@
+The "FreeRTOS WebRTC Reference on Ameba Pro2" project includes the following third-party software/licensing:
+
+** The freertos-kvs-LTS by Realtek Semiconductor Corporation - https://github.com/Freertos-kvs-LTS/freertos-kvs-LTS
+
+Licensing information : https://github.com/Freertos-kvs-LTS/freertos-kvs-LTS/blob/bd0702130e0b8dfa386e011644ce1bc7e0d7fd09/Realtek_Disclaimer-2019.pdf
+
+// Original Copyright 2012 2016, Realtek Semiconductor Corporation. Licensed under [Realtek's Disclaimer](https://github.com/Freertos-kvs-LTS/freertos-kvs-LTS/blob/bd0702130e0b8dfa386e011644ce1bc7e0d7fd09/Realtek_Disclaimer-2019.pdf).
+// Modifications Copyright 2016 Amazon.com, Inc. or its affiliates. All Rights Reserved.
+
+The following file from "freertos-kvs-LTS" file is included as is or with modifications in this project.
+- [lwipopts.h](./configs/lwip/lwipopts.h)
+- [project/realtek_amebapro2_webrtc_application](./project/realtek_amebapro2_webrtc_application)

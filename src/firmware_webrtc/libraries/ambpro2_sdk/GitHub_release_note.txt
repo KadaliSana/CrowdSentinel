@@ -1,0 +1,17 @@
+
+GitHub Update Note, sync with 9.6_r
+
+SHA-1: 696e9011fdc2a711625b2df2882c8876713ac866
+* [amebapro2][sdk] fix warning in ai glass scenario
+
+SHA-1: 814bf67e48e7b1da996d5bbebe84c8b2eeda4f41
+* [amebapro2][sdk] add new scenario - ai glass
+
+SHA-1: ccd2b17cbee9a5faa0004f138139c123463a8904
+* [amebapro2][video] update sensor driver & video related default setting
+
+SHA-1: de335da71c69cb58e8484e3a20ae650b5b152647
+* [amebapro2][sdk] add sceranio setting for sdk
+
+SHA-1: 1800a37a0d3d516013bf837df21f4fe8f5125b84
+* [amebapro2][wlan] avoid wifi_off crash issue

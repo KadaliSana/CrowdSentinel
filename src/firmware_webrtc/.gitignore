@@ -1,0 +1,6 @@
+writev
+examples/demo_config/demo_config.h
+.vscode
+project/realtek_amebapro2_webrtc_application/GCC-RELEASE/build/
+project/realtek_amebapro2_webrtc_application/GCC-RELEASE/mp/
+asdk-10.3.0/

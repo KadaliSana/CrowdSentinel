@@ -1,2 +1,32 @@
 .env
 *.zip
+# AWS credentials live here - never commit
+src/firmware_webrtc/examples/demo_config/demo_config.h
+
+# regenerable firmware build output
+*/GCC-RELEASE/build/
+*/GCC-RELEASE/build_*/
+
+# nested git repos (own history/remote, not captured by this repo)
+src/firmware_rtsp/
+models/acuity/
+
+# defensive: live-looking AWS key lives here if firmware_rtsp is ever tracked
+src/firmware_rtsp/component/example/kvs_producer_mmf/sample_config.h
+
+# python build artifacts (regenerable)
+venv/
+.venv/
+__pycache__/
+*.pyc
+.DS_Store
+
+# training dataset images (large, not pushed)
+models/dataset/train/
+models/dataset/valid/
+models/dataset/test/
+
+# pretrained base checkpoints (not the model in use) and regenerable ONNX exports
+models/dataset/yolo26n.pt
+models/dataset/yolo26s.pt
+models/weights/*.onnx

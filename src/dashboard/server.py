@@ -1,0 +1,205 @@
+import cv2
+import time
+import threading
+import os
+import numpy as np
+from flask import Flask, Response, render_template, request, jsonify
+from ultralytics import YOLO
+from dotenv import load_dotenv
+
+load_dotenv()
+
+# Must be set before the first VideoCapture is constructed, so keep it at import time.
+os.environ.setdefault("OPENCV_FFMPEG_CAPTURE_OPTIONS", "rtsp_transport;tcp")
+
+app = Flask(__name__, template_folder='templates', static_folder='static')
+
+# --- Configuration ---
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+RTSP_URL = os.getenv("RTSP_URL", "rtsp://10.76.11.62")
+MODEL_PATH = os.getenv("MODEL_PATH", os.path.join(BASE_DIR, "best.pt"))
+CONF_THRESH = float(os.getenv("CONF_THRESH", "0.5"))
+PERSON_CLASS = 0
+
+# Frame is downscaled to this before inference, then boxes are scaled back up.
+AI_WIDTH = int(os.getenv("AI_WIDTH", "640"))
+AI_HEIGHT = int(os.getenv("AI_HEIGHT", "360"))
+
+# --- Global Resources ---
+# Load eagerly and let a missing/corrupt model raise: silently falling back to a
+# different model produces confusing detections that look like a firmware bug.
+print(f"[System] Loading YOLO model: {MODEL_PATH}")
+if not os.path.exists(MODEL_PATH):
+    raise FileNotFoundError(
+        f"Model not found at {MODEL_PATH}. Set MODEL_PATH in src/.env or place the "
+        f"weights there. The canonical crowd model is crowd/nano/best.pt."
+    )
+model = YOLO(MODEL_PATH)
+
+model_lock = threading.Lock()
+
+# --- Shared State ---
+class VideoState:
+    def __init__(self):
+        self.frame = None
+        self.boxes = []
+        self.count = 0
+        self.lock = threading.Lock()
+        self.running = False
+
+state = VideoState()
+
+def open_capture():
+    cap = cv2.VideoCapture(RTSP_URL)
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    return cap
+
+# --- Thread Functions ---
+def capture_loop():
+    print(f"[Thread 1] Connecting to Stream: {RTSP_URL}...")
+    cap = open_capture()
+
+    while state.running:
+        ret, frame = cap.read()
+        if not ret:
+            print("Stream interrupted. Reconnecting in 2s...")
+            cap.release()
+            time.sleep(2)
+            cap = open_capture()
+            continue
+
+        with state.lock:
+            state.frame = frame
+
+    cap.release()
+    print("[Thread 1] Stopped.")
+
+def ai_loop():
+    print("[Thread 2] AI Processing Started...")
+
+    while state.running:
+        working_frame = None
+        with state.lock:
+            if state.frame is not None:
+                working_frame = state.frame.copy()
+
+        if working_frame is None:
+            time.sleep(0.05)
+            continue
+
+        orig_h, orig_w = working_frame.shape[:2]
+        input_frame = cv2.resize(working_frame, (AI_WIDTH, AI_HEIGHT))
+
+        with model_lock:
+            results = model(input_frame, conf=CONF_THRESH, classes=[PERSON_CLASS], verbose=False)
+
+        current_boxes = []
+        if len(results) > 0:
+            det_boxes = results[0].boxes.xyxy.cpu().numpy()
+            x_scale = orig_w / AI_WIDTH
+            y_scale = orig_h / AI_HEIGHT
+
+            for x1, y1, x2, y2 in det_boxes:
+                current_boxes.append((
+                    int(x1 * x_scale), int(y1 * y_scale),
+                    int(x2 * x_scale), int(y2 * y_scale),
+                ))
+
+        with state.lock:
+            state.count = len(current_boxes)
+            state.boxes = current_boxes
+
+        time.sleep(0.01)
+    print("[Thread 2] Stopped.")
+
+# --- Flask Routes ---
+
+@app.route('/start_stream', methods=['POST'])
+def start_stream():
+    if not state.running:
+        state.running = True
+        threading.Thread(target=capture_loop, daemon=True).start()
+        threading.Thread(target=ai_loop, daemon=True).start()
+        return jsonify({"status": "started"})
+    return jsonify({"status": "already_running"})
+
+@app.route('/stop_stream', methods=['POST'])
+def stop_stream():
+    if state.running:
+        state.running = False
+        time.sleep(0.5)
+        with state.lock:
+            state.frame = None
+            state.count = 0
+            state.boxes = []
+        return jsonify({"status": "stopped"})
+    return jsonify({"status": "not_running"})
+
+@app.route('/upload', methods=['POST'])
+def upload_photo():
+    if 'file' not in request.files:
+        return jsonify({"error": "No file"}), 400
+    file = request.files['file']
+
+    try:
+        file_bytes = np.frombuffer(file.read(), np.uint8)
+        img = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
+        if img is None:
+            return jsonify({"error": "Could not decode image"}), 400
+        with model_lock:
+            results = model(img, conf=CONF_THRESH, classes=[PERSON_CLASS], verbose=False)
+        count = len(results[0].boxes)
+        return jsonify({"message": "Success", "detected_count": count})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/video_feed')
+def video_feed():
+    def generate_annotated_feed():
+        while state.running:
+            with state.lock:
+                frame = state.frame
+                output_frame = frame.copy() if frame is not None else None
+                current_boxes = list(state.boxes)
+
+            # Sleep outside the lock: holding it here stalls capture and inference.
+            if output_frame is None:
+                time.sleep(0.1)
+                continue
+
+            for (x1, y1, x2, y2) in current_boxes:
+                cv2.rectangle(output_frame, (x1, y1), (x2, y2), (0, 255, 255), 2)
+                cv2.putText(output_frame, "TARGET", (x1, y1 - 10),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+
+            ret, buffer = cv2.imencode('.jpg', output_frame)
+            if ret:
+                yield (b'--frame\r\n'
+                       b'Content-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n')
+            time.sleep(0.033)
+
+    return Response(generate_annotated_feed(), mimetype='multipart/x-mixed-replace; boundary=frame')
+
+@app.route('/count_feed')
+def count_feed():
+    def generate_sse_count():
+        last_count = -1
+        while True:
+            if not state.running:
+                yield "data: 0\n\n"
+                break
+            with state.lock:
+                c = state.count
+            if c != last_count:
+                yield f"data: {c}\n\n"
+                last_count = c
+            time.sleep(0.5)
+    return Response(generate_sse_count(), mimetype='text/event-stream')
+
+# --- Frontend Template ---
+@app.route('/')
+def index():
+    return render_template('index.html')
+
+if __name__ == "__main__":
+    app.run(host='0.0.0.0', port=5000, threaded=True)

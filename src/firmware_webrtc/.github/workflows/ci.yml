@@ -1,0 +1,90 @@
+name: CI Checks
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+env:
+  # Customize the CMake build type here (Release, Debug, RelWithDebInfo, etc.)
+  BUILD_TYPE: Debug
+  bashPass: \033[32;1mPASSED -
+  bashInfo: \033[33;1mWINFO -
+  bashFail: \033[31;1mFAILED -
+  bashEnd:  \033[0m
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Clone this repo
+      uses: actions/checkout@v4
+      with:
+        submodules: recursive
+    - env:
+        stepName: Install Dependencies
+      name: ${{ env.stepName }}
+      run: |
+        # ${{ env.stepName }}
+        echo -e "::group::${{ env.bashInfo }} ${{ env.stepName }} ${{ env.bashEnd }}"
+
+        sudo apt-get update -y
+        mkdir Tools
+        pushd Tools
+        wget https://github.com/Ameba-AIoT/ameba-toolchain/releases/download/V10.3.0-amebe-rtos-pro2/asdk-10.3.0-linux-newlib-build-3638-x86_64.tar.bz2
+        tar -xvf asdk-10.3.0-*.tar.bz2
+        popd
+
+        echo "::endgroup::"
+        echo -e "${{ env.bashPass }} ${{ env.stepName }} ${{ env.bashEnd }}"
+    - env:
+        stepName: Create demo_config.h
+      name: ${{ env.stepName }}
+      run: |
+        # ${{ env.stepName }}
+        echo -e "::group::${{ env.bashInfo }} ${{ env.stepName }} ${{ env.bashEnd }}"
+
+        cp examples/demo_config/demo_config_template.h examples/demo_config/demo_config.h
+
+        echo "::endgroup::"
+        echo -e "${{ env.bashPass }} ${{ env.stepName }} ${{ env.bashEnd }}"
+    - env:
+        stepName: Build normal image
+      name: ${{ env.stepName }}
+
+      run: |
+        echo -e "::group::${{ env.bashInfo }} ${{ env.stepName }} ${{ env.bashEnd }}"
+        export PATH=${{github.workspace}}/Tools/asdk-10.3.0/linux/newlib/bin:$PATH
+        echo -e "PATH: $PATH"
+
+        # Grant execute permission for build process.
+        chmod +x ${{github.workspace}}/libraries/ambpro2_sdk/project/realtek_amebapro2_v0_example/GCC-RELEASE/mp/*.linux
+
+        rm -rf ${{github.workspace}}/project/realtek_amebapro2_webrtc_application/GCC-RELEASE/build
+        mkdir ${{github.workspace}}/project/realtek_amebapro2_webrtc_application/GCC-RELEASE/build
+        pushd ${{github.workspace}}/project/realtek_amebapro2_webrtc_application/GCC-RELEASE/build
+        cmake .. -G"Unix Makefiles" -DCMAKE_BUILD_TYPE=${{env.BUILD_TYPE}} -DCMAKE_TOOLCHAIN_FILE=../toolchain.cmake
+        cmake --build . --target flash
+        popd
+        echo "::endgroup::"
+        echo -e "${{ env.bashPass }} ${{ env.stepName }} ${{ env.bashEnd }}"
+    - env:
+        stepName: Build loopback image
+      name: ${{ env.stepName }}
+
+      run: |
+        echo -e "::group::${{ env.bashInfo }} ${{ env.stepName }} ${{ env.bashEnd }}"
+        export PATH=${{github.workspace}}/Tools/asdk-10.3.0/linux/newlib/bin:$PATH
+        echo -e "PATH: $PATH"
+        
+        rm -rf ${{github.workspace}}/project/realtek_amebapro2_webrtc_application/GCC-RELEASE/build
+        mkdir ${{github.workspace}}/project/realtek_amebapro2_webrtc_application/GCC-RELEASE/build
+        pushd ${{github.workspace}}/project/realtek_amebapro2_webrtc_application/GCC-RELEASE/build
+        cmake .. -G"Unix Makefiles" -DCMAKE_BUILD_TYPE=${{env.BUILD_TYPE}} -DCMAKE_TOOLCHAIN_FILE=../toolchain.cmake -DENABLE_STREAMING_LOOPBACK=ON
+        cmake --build . --target flash
+        popd
+        echo "::endgroup::"
+        echo -e "${{ env.bashPass }} ${{ env.stepName }} ${{ env.bashEnd }}"
+
