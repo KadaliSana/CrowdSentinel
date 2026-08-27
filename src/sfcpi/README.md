@@ -24,6 +24,7 @@ bare checkout. Install it once, from the repository root:
     python3 -m sfcpi.cli run clip.mp4 --out metrics.jsonl --cell-size 64
     python3 -m sfcpi.cli eval metrics.jsonl --labels labels.csv
     python3 -m sfcpi.cli occlusion counts.csv --out curve.csv
+    python3 -m sfcpi.cli watch metrics.jsonl
 
 `eval` derives the frame rate from the `timestamp` column of the metrics file;
 pass `--fps` only to override it. It falls back to 25 fps, with a warning on
@@ -44,6 +45,27 @@ not zero**: counts, density and pressure come out NaN (`null` in the JSONL) and
 because motion really was measured. This is the same fail-loud path the
 pipeline takes when a real detector throws — there is exactly one degradation
 semantics, not two.
+
+### `watch` — replay metrics through the risk state machine
+
+    python3 -m sfcpi.cli watch metrics.jsonl --threshold-high 0.02 --min-dwell 2.0
+
+Reads a `sfcpi run` JSONL metrics file line by line and feeds `--score-field`
+(default `global_max_pressure`) through the hysteresis + dwell + re-alert
+state machine (`sfcpi.risk`), printing `[ALERT ...]` lines to stderr via
+`LogSink` as levels change. A `null` score is read as NaN, never `0.0` — a
+blind sensor must reach the state machine as UNKNOWN (raising a
+`sensor-blind` alert after it dwells), not as a falsely-calm `NORMAL`
+reading.
+
+Pass `--sns --sns-topic-arn arn:aws:sns:...` to also publish to AWS SNS.
+**`--dry-run` defaults to `true` whenever `--sns` is given** — alerts are
+logged as "would publish" but nothing is sent — because thresholds get tuned
+against recorded data, not against real phones, and SNS email subscriptions
+can be rate-limited by exactly that kind of iteration. Pass `--no-dry-run`
+explicitly to actually publish. `--sns` without a topic ARN exits non-zero
+rather than running silently without alerting. Live delivery additionally
+requires the caller's AWS credentials to have `sns:Publish` on the topic ARN.
 
 ## Design rules
 

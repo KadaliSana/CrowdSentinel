@@ -116,6 +116,67 @@ def _cmd_eval(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_watch(args: argparse.Namespace) -> int:
+    import json
+
+    from .risk.levels import Thresholds
+    from .risk.machine import RiskStateMachine
+    from .alerts.log import LogSink
+
+    sinks = [LogSink()]
+
+    if args.sns:
+        if not args.sns_topic_arn:
+            print(
+                "error: --sns given without a topic ARN; pass --sns-topic-arn "
+                "(no default -- refusing to run with SNS enabled and no destination)",
+                file=sys.stderr,
+            )
+            return 2
+        import boto3
+        from .alerts.sns import SnsSink
+
+        client = boto3.client("sns", region_name=args.sns_region)
+        sinks.append(
+            SnsSink(args.sns_topic_arn, client, dry_run=args.dry_run)
+        )
+
+    # Only --threshold-high is exposed on the CLI; keep the default ratio
+    # between rise/fall (0.8, from the Thresholds defaults 0.016/0.020) so a
+    # custom --threshold-high still satisfies the hysteresis invariant.
+    thresholds = Thresholds(
+        high_rise=args.threshold_high, high_fall=args.threshold_high * 0.8
+    )
+
+    # There is a single --min-dwell knob on this CLI (not one per tier), so it
+    # is reused for blind_alert_s too: a NaN pressure (sensor gone blind) must
+    # dwell just like any other candidate level before being adopted.
+    machine = RiskStateMachine(
+        thresholds,
+        min_dwell_s=args.min_dwell,
+        min_realert_s=args.min_realert,
+        blind_alert_s=args.min_dwell,
+    )
+
+    with open(args.metrics, encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            row = json.loads(line)
+            value = row.get(args.score_field)
+            pressure = float("nan") if value is None else float(value)
+            ts = row.get("timestamp")
+            timestamp = 0.0 if ts is None else float(ts)
+
+            event = machine.update(timestamp, pressure)
+            if event is not None:
+                for sink in sinks:
+                    sink.publish(event)
+
+    return 0
+
+
 def _cmd_occlusion(args: argparse.Namespace) -> int:
     import csv
     import json
@@ -184,6 +245,31 @@ def build_parser() -> argparse.ArgumentParser:
     oc.add_argument("--out", required=True)
     oc.add_argument("--bins", type=int, default=10)
     oc.set_defaults(func=_cmd_occlusion)
+
+    watch = sub.add_parser(
+        "watch", help="replay a metrics file through the risk state machine into alert sinks"
+    )
+    watch.add_argument("metrics")
+    watch.add_argument("--threshold-high", type=float, default=0.02,
+                       help="high-tier rise threshold in s^-2 (fall is scaled to keep "
+                            "the default 0.8 rise/fall ratio)")
+    watch.add_argument("--min-dwell", type=float, default=2.0,
+                       help="seconds a candidate level (including sensor-blind) must "
+                            "persist before it is adopted")
+    watch.add_argument("--min-realert", type=float, default=60.0,
+                       help="seconds to suppress a repeat de-escalation alert for the "
+                            "same level; escalations always bypass this")
+    watch.add_argument("--score-field", default="global_max_pressure")
+    watch.add_argument("--sns", action="store_true",
+                       help="also publish alerts to AWS SNS (requires --sns-topic-arn)")
+    watch.add_argument("--sns-topic-arn", default=None)
+    watch.add_argument("--sns-region", default=None)
+    watch.add_argument("--dry-run", dest="dry_run", action=argparse.BooleanOptionalAction,
+                       default=True,
+                       help="log what would be published without calling SNS; defaults "
+                            "to True whenever --sns is given -- pass --no-dry-run to "
+                            "actually publish")
+    watch.set_defaults(func=_cmd_watch)
     return parser
 
 
