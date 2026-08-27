@@ -10,7 +10,7 @@ from .flow import FlowEstimator
 from .grid import CellGrid
 from .pipeline import Pipeline
 from .sinks import JsonlSink
-from .sources import FileSource
+from .sources import DEFAULT_FPS as DEFAULT_EVAL_FPS, FileSource
 
 
 def _cmd_run(args: argparse.Namespace) -> int:
@@ -49,6 +49,31 @@ def _cmd_run(args: argparse.Namespace) -> int:
     return 0
 
 
+def _fps_from_timestamps(timestamps: List[Optional[float]]) -> Optional[float]:
+    """Recover the frame rate from the JSONL `timestamp` column.
+
+    The metrics file already encodes the true frame rate; ignoring it and
+    assuming 25 fps reports FAR/h 2.5x wrong on a 10 fps clip. Uses the MEDIAN
+    inter-frame delta so a single dropped or duplicated timestamp cannot skew
+    it. Returns None when the timestamps cannot support an estimate, so the
+    caller can fall back to the documented default.
+    """
+    import math
+
+    values = [t for t in timestamps if isinstance(t, (int, float)) and math.isfinite(t)]
+    if len(values) < 2:
+        return None
+    deltas = [b - a for a, b in zip(values, values[1:]) if b - a > 0]
+    if not deltas:
+        return None
+    deltas.sort()
+    mid = len(deltas) // 2
+    median = deltas[mid] if len(deltas) % 2 else (deltas[mid - 1] + deltas[mid]) / 2.0
+    if median <= 0:
+        return None
+    return 1.0 / median
+
+
 def _cmd_eval(args: argparse.Namespace) -> int:
     import json
     import math
@@ -56,14 +81,27 @@ def _cmd_eval(args: argparse.Namespace) -> int:
     from .eval import evaluate, load_labels
 
     scores = []
+    timestamps: List[Optional[float]] = []
     with open(args.metrics, encoding="utf-8") as fh:
         for line in fh:
             row = json.loads(line)
             value = row.get(args.score_field)
             scores.append(float("nan") if value is None else float(value))
+            ts = row.get("timestamp")
+            timestamps.append(None if ts is None else float(ts))
+
+    fps = args.fps
+    if fps is None:
+        fps = _fps_from_timestamps(timestamps)
+        if fps is None:
+            fps = DEFAULT_EVAL_FPS
+            print(f"warning: no usable timestamps in {args.metrics}; "
+                  f"assuming --fps {fps}", file=sys.stderr)
+
     labels = load_labels(args.labels)
     n = min(len(scores), len(labels))
-    result = evaluate(np.array(scores[:n]), labels[:n], args.threshold, args.fps)
+    result = evaluate(np.array(scores[:n]), labels[:n], args.threshold, fps)
+    result["fps"] = float(fps)
 
     def _jsonable(value):
         if isinstance(value, float) and not math.isfinite(value):
@@ -104,7 +142,6 @@ class _CroppedSource:
 
     def __iter__(self):
         for frame in self._inner:
-            self.fps = self._inner.fps
             yield type(frame)(frame.index, frame.timestamp, frame.image[: self._h, : self._w])
 
 
@@ -128,7 +165,10 @@ def build_parser() -> argparse.ArgumentParser:
     ev.add_argument("metrics")
     ev.add_argument("--labels", required=True)
     ev.add_argument("--threshold", type=float, default=0.02)
-    ev.add_argument("--fps", type=float, default=25.0)
+    ev.add_argument("--fps", type=float, default=None,
+                    help=f"frame rate for the FAR/h denominator; default is "
+                         f"derived from the metrics file's timestamps, falling "
+                         f"back to {DEFAULT_EVAL_FPS}")
     ev.add_argument("--score-field", default="global_max_pressure")
     ev.set_defaults(func=_cmd_eval)
 
