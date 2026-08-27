@@ -4,11 +4,14 @@ Three mechanisms, all required, because a raw threshold on a noisy signal
 flaps and at 15 fps that is tens of alerts a second:
   hysteresis  - separate rise/fall thresholds (in levels.classify)
   dwell       - a candidate level must persist before it is adopted
-  re-alert    - escalation always bypasses this interval (getting worse must
-                always be heard immediately); de-escalation is gated by it,
-                keyed on the level being stepped down from, so an
-                oscillating signal cannot emit alternating alert / all-clear
-                pairs forever
+  re-alert    - bypassed only when the candidate genuinely escalates PAST
+                the last level actually alerted (severity(candidate) >
+                severity(last_alerted_level)), or on the first-ever alert,
+                or for sensor-blind, which is always heard immediately.
+                Re-escalating back up to a level already alerted, and any
+                de-escalation, are gated by time instead -- otherwise a slow
+                full-swing oscillation (HIGH -> NORMAL -> HIGH -> ...) would
+                re-alert every dwell period forever, at any min_realert_s
 
 Dwell tracks divergence from the *adopted* level (self.level), not the exact
 candidate value. A noisy signal straddling a boundary (e.g. flapping between
@@ -86,29 +89,54 @@ class RiskStateMachine:
         self.level = candidate
         self._reset_timers()
 
-        old, new = severity(previous), severity(candidate)
-        if old is None or new is None:
-            reason = "sensor-blind" if candidate is RiskLevel.UNKNOWN else "escalation"
-        elif new > old:
-            reason = "escalation"
-        elif new < old:
-            reason = "de-escalation"
-        else:  # pragma: no cover - equal severities cannot differ in level
-            reason = "sustained"
+        if candidate is RiskLevel.UNKNOWN:
+            reason = "sensor-blind"
+        elif previous is RiskLevel.UNKNOWN:
+            # UNKNOWN carries no ordered severity to compare against, so a
+            # return from it is its own reason rather than a mislabelled
+            # escalation/de-escalation.
+            reason = "recovery"
+        else:
+            old, new = severity(previous), severity(candidate)
+            if new > old:
+                reason = "escalation"
+            elif new < old:
+                reason = "de-escalation"
+            else:  # pragma: no cover - equal severities cannot differ in level
+                reason = "sustained"
 
-        # Re-alert gate: escalation ("getting worse") must always be heard
-        # immediately, so it always bypasses the interval -- even back up to
-        # a level that was already alerted. De-escalation (the all-clear) is
-        # gated instead, keyed on the level being stepped down FROM: without
-        # this, an oscillating signal emits alternating alert / all-clear
-        # pairs forever, which defeats the anti-spam purpose of this gate.
-        if reason == "de-escalation":
+        # Re-alert gate.
+        if reason == "sensor-blind":
+            pass  # a blind sensor is itself an incident -- always heard immediately
+        elif reason == "recovery" and candidate is RiskLevel.NORMAL:
+            # Recovery to NORMAL is the resolution of a prior blind alert --
+            # gate it the same way as any other all-clear.
             if (
                 self._last_alerted_level is previous
                 and self._last_alert_t is not None
                 and (t - self._last_alert_t) < self.min_realert_s
             ):
                 return None
+        elif reason == "recovery":
+            pass  # recovery straight to danger (ELEVATED+) always heard immediately
+        else:
+            # escalation / de-escalation: bypass only when the candidate
+            # genuinely escalates PAST the last level actually alerted.
+            # Equal or lower severity (including re-escalating back up to
+            # the same level) is gated by time instead.
+            last_sev = (
+                severity(self._last_alerted_level)
+                if self._last_alerted_level is not None
+                else None
+            )
+            cand_sev = severity(candidate)
+            escalates_past_last_alert = last_sev is None or cand_sev > last_sev
+            if not escalates_past_last_alert:
+                if (
+                    self._last_alert_t is not None
+                    and (t - self._last_alert_t) < self.min_realert_s
+                ):
+                    return None
 
         self._last_alerted_level = candidate
         self._last_alert_t = t

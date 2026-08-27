@@ -69,6 +69,22 @@ def test_de_escalation_is_reported():
     assert ev is not None and ev.level is RiskLevel.NORMAL
     assert ev.reason == "de-escalation"
 
+def test_full_swing_oscillation_does_not_realert_at_the_same_level():
+    """HIGH -> NORMAL -> HIGH -> ... must not re-alert HIGH every few seconds.
+    Suppressing only de-escalation left min_realert_s dead in this direction."""
+    m = _machine(min_dwell_s=2.0, min_realert_s=600.0)
+    m.update(0.0, 0.0)
+    events, t = [], 1.0
+    for cycle in range(6):
+        for _ in range(3):                      # ~3s above high_rise
+            ev = m.update(t, 0.025); t += 1.0
+            if ev: events.append(ev)
+        for _ in range(3):                      # ~3s at zero
+            ev = m.update(t, 0.0); t += 1.0
+            if ev: events.append(ev)
+    highs = [e for e in events if e.level is RiskLevel.HIGH]
+    assert len(highs) == 1, f"expected 1 HIGH alert, got {len(highs)}"
+
 def test_clock_going_backwards_resets_timers_without_negative_dwell():
     """Replay restart must not emit a negative-duration transition."""
     m = _machine()

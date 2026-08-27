@@ -35,8 +35,10 @@ def test_unknown_never_reports_as_normal():
 def test_recovery_from_blind_is_reported():
     """Recovery FROM UNKNOWN uses the normal dwell (min_dwell_s), not
     blind_alert_s -- the extra dwell only applies to going blind, not to
-    coming back."""
-    m = _m()
+    coming back. min_realert_s is short here so the recovery-to-NORMAL
+    gate (see test_recovery_to_normal_is_gated_below) does not swallow it --
+    that gate is pinned separately."""
+    m = _m(min_realert_s=1.0)
     m.update(0.0, 0.0)
     m.update(1.0, float("nan"))
     m.update(11.5, float("nan"))                     # -> UNKNOWN (blind_alert_s met)
@@ -46,6 +48,31 @@ def test_recovery_from_blind_is_reported():
     # blind_alert_s -- swapping them would still be None at this point.
     ev = m.update(14.5, 0.0)
     assert ev is not None and ev.level is RiskLevel.NORMAL
+    assert ev.reason == "recovery"
+
+def test_recovery_to_normal_is_gated_by_the_realert_interval():
+    """Recovery to NORMAL is the resolution of the prior blind alert -- it
+    goes through the same re-alert gate as any other all-clear."""
+    m = _m(min_realert_s=600.0)
+    m.update(0.0, 0.0)
+    m.update(1.0, float("nan"))
+    m.update(11.5, float("nan"))                     # -> UNKNOWN, sensor-blind fires
+    m.update(12.0, 0.0)
+    assert m.update(14.5, 0.0) is None                # recovered, but too soon to re-alert
+
+def test_recovery_to_danger_bypasses_the_realert_interval():
+    """A sensor coming back and immediately showing danger must be heard --
+    there is no pre-blind severity to compare against, so this is not gated
+    the way recovery-to-NORMAL is."""
+    m = _m(min_realert_s=600.0)
+    m.update(0.0, 0.0)
+    m.update(1.0, float("nan"))
+    m.update(11.5, float("nan"))                     # -> UNKNOWN, sensor-blind fires
+    m.update(12.0, 0.025)                             # candidate HIGH
+    ev = m.update(14.0, 0.025)                        # min_dwell_s met
+    assert ev is not None
+    assert ev.level is RiskLevel.HIGH
+    assert ev.reason == "recovery"
 
 def test_escalation_bypasses_the_realert_interval():
     """Getting worse must always be heard immediately."""

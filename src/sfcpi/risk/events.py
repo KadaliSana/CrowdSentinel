@@ -14,5 +14,5 @@ class RiskEvent:
     previous_level: RiskLevel
     pressure: Optional[float]
     coverage: Optional[float]
-    reason: str          # escalation | de-escalation | sustained | sensor-blind
+    reason: str          # escalation | de-escalation | sustained | sensor-blind | recovery
     message: str
