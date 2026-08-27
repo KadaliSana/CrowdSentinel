@@ -47,8 +47,15 @@ class FileSource:
     def __init__(self, path: str, max_frames: Optional[int] = None) -> None:
         self.path = path
         self.max_frames = max_frames
-        self.fps = DEFAULT_FPS
-        self._probed = False
+        self.fps = self._probe_fps()
+
+    def _probe_fps(self) -> float:
+        cap = self._open()
+        try:
+            fps = cap.get(cv2.CAP_PROP_FPS)
+            return float(fps) if fps and fps > 0 else DEFAULT_FPS
+        finally:
+            cap.release()
 
     def _open(self) -> cv2.VideoCapture:
         if not os.path.exists(self.path):
@@ -56,9 +63,6 @@ class FileSource:
         cap = cv2.VideoCapture(self.path)
         if not cap.isOpened():
             raise OSError(f"could not open video: {self.path}")
-        fps = cap.get(cv2.CAP_PROP_FPS)
-        self.fps = float(fps) if fps and fps > 0 else DEFAULT_FPS
-        self._probed = True
         return cap
 
     def __iter__(self) -> Iterator[Frame]:

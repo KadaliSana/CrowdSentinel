@@ -41,3 +41,15 @@ def test_file_source_respects_max_frames(tmp_path):
         writer.write(np.full((32, 32, 3), i * 10, np.uint8))
     writer.release()
     assert len(list(FileSource(path, max_frames=3))) == 3
+
+def test_fps_is_correct_before_iteration(tmp_path):
+    """Reading .fps before iterating must not return the 25.0 default."""
+    import cv2
+    path = str(tmp_path / "clip.mp4")
+    writer = cv2.VideoWriter(path, cv2.VideoWriter_fourcc(*"mp4v"), 10.0, (32, 32))
+    for i in range(3):
+        writer.write(np.full((32, 32, 3), i * 20, np.uint8))
+    writer.release()
+
+    src = FileSource(path)          # note: NOT iterated
+    assert src.fps == pytest.approx(10.0)
