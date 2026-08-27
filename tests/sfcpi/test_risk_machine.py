@@ -92,3 +92,24 @@ def test_clock_going_backwards_resets_timers_without_negative_dwell():
     m.update(101.0, 0.025)
     assert m.update(0.0, 0.025) is None        # clock reset: dwell restarts
     assert m.update(2.5, 0.025) is not None
+
+
+def test_non_finite_timestamp_is_rejected():
+    """A NaN t makes `held_for < required_dwell` and `(t - last) < realert`
+    both False, defeating the dwell gate AND the re-alert gate at once --
+    an alert on every level change, unbounded."""
+    m = _machine(min_realert_s=600.0)
+    m.update(0.0, 0.0)
+    for bad in (float("nan"), float("inf"), float("-inf")):
+        with pytest.raises(ValueError, match="timestamp"):
+            m.update(bad, 0.05)
+    # A rejected call must not have disturbed the state it was rejected for.
+    assert m.level is RiskLevel.NORMAL
+    assert m.update(1.0, 0.05) is None          # dwell still pending
+    assert m.update(3.0, 0.05) is not None
+
+
+def test_min_coverage_must_be_a_fraction():
+    for bad in (-0.1, 1.5, float("nan")):
+        with pytest.raises(ValueError, match="min_coverage"):
+            RiskStateMachine(thresholds=T, min_coverage=bad)

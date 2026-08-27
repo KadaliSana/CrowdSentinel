@@ -36,7 +36,10 @@ def severity(level: RiskLevel) -> Optional[int]:
 class Thresholds:
     """Rise/fall pairs in s^-2. Defaults reference Johansson/Helbing's
     turbulence onset at 0.02 s^-2 -- a DEFAULT, not a constant (it is
-    R-dependent). Every fall must sit strictly below its rise."""
+    R-dependent). Every fall must sit strictly below its rise, AND the tiers
+    must be ordered across each other: a per-tier check alone lets an
+    operator raise high_rise past critical_rise, after which a pressure
+    below their own HIGH threshold classifies as CRITICAL."""
 
     elevated_rise: float = 0.010
     elevated_fall: float = 0.008
@@ -54,6 +57,18 @@ class Thresholds:
                     f"{name}_fall ({fall}) must be strictly below {name}_rise ({rise}); "
                     "equal or inverted thresholds defeat hysteresis"
                 )
+        # Cross-tier ordering. classify() evaluates the tiers most-severe
+        # first, so an out-of-order pair silently shadows a whole tier.
+        for kind in ("rise", "fall"):
+            for lower, upper in (("elevated", "high"), ("high", "critical")):
+                a, b = f"{lower}_{kind}", f"{upper}_{kind}"
+                va, vb = getattr(self, a), getattr(self, b)
+                if not va < vb:
+                    raise ValueError(
+                        f"{a} ({va}) must be strictly below {b} ({vb}); "
+                        "out-of-order tiers classify a pressure as more severe "
+                        "than the threshold it has not reached"
+                    )
 
 
 def classify(
