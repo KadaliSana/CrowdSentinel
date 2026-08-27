@@ -57,3 +57,26 @@ def test_unknown_level_event_still_publishes():
                    pressure=None, coverage=0.0, reason="sensor-blind", message="sensor blind")
     SnsSink(topic_arn=ARN, client=c).publish(ev)
     assert len(c.calls) == 1 and "n/a" in c.calls[0]["Message"]
+
+def test_long_subject_prefix_is_truncated_to_the_sns_limit():
+    """SNS rejects subjects over 100 chars, and a rejected publish is a silently
+    dropped alert -- so truncation must be enforced, not merely documented."""
+    c = _StubClient()
+    s = SnsSink(topic_arn=ARN, client=c, subject_prefix="X" * 200)
+    s.publish(_ev())
+    subject = c.calls[0]["Subject"]
+    assert len(subject) == 100
+    assert subject.startswith("XXX")
+
+def test_none_coverage_renders_as_na_not_zero_percent():
+    c = _StubClient()
+    ev = RiskEvent(timestamp=2.0, level=RiskLevel.UNKNOWN, previous_level=RiskLevel.NORMAL,
+                   pressure=None, coverage=None, reason="sensor-blind", message="sensor blind")
+    SnsSink(topic_arn=ARN, client=c).publish(ev)
+    body = c.calls[0]["Message"]
+    assert "Coverage:   n/a" in body
+    assert "0%" not in body
+
+def test_missing_client_fails_at_construction():
+    with pytest.raises(ValueError, match="client"):
+        SnsSink(topic_arn=ARN, client=None)

@@ -16,7 +16,13 @@ _SUBJECT_MAX = 100  # SNS hard limit
 
 
 class SnsSink:
-    def __init__(self, topic_arn: str, client: Any, dry_run: bool = False) -> None:
+    def __init__(
+        self,
+        topic_arn: str,
+        client: Any,
+        dry_run: bool = False,
+        subject_prefix: str = "[CrowdSentinel]",
+    ) -> None:
         if not topic_arn:
             raise ValueError("topic_arn is required; refusing to start with SNS enabled and no topic")
         if client is None:
@@ -24,11 +30,12 @@ class SnsSink:
         self.topic_arn = topic_arn
         self.client = client
         self.dry_run = dry_run
+        self.subject_prefix = subject_prefix
         self.count = 0
         self.failures = 0
 
     def _subject(self, event: RiskEvent) -> str:
-        return f"[CrowdSentinel] {event.level.value.upper()}"[:_SUBJECT_MAX]
+        return f"{self.subject_prefix} {event.level.value.upper()}"[:_SUBJECT_MAX]
 
     def _body(self, event: RiskEvent) -> str:
         pressure = "n/a" if event.pressure is None else f"{event.pressure:.4f} s^-2"
