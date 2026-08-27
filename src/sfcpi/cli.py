@@ -67,6 +67,26 @@ def _cmd_eval(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_occlusion(args: argparse.Namespace) -> int:
+    import csv
+    import json
+    from .occlusion import DetectionRatePoint, detection_rate_curve, is_monotonic_decreasing
+
+    points = []
+    with open(args.counts, newline="", encoding="utf-8") as fh:
+        for row in csv.DictReader(fh):
+            points.append(DetectionRatePoint.from_counts(
+                true_count=int(row["true_count"]),
+                detected_count=int(row["detected_count"]),
+                density_proxy=float(row.get("density_proxy", row["true_count"])),
+            ))
+    curve = detection_rate_curve(points, n_bins=args.bins)
+    curve.to_csv(args.out, index=False)
+    print(curve.to_string(index=False))
+    print(json.dumps({"monotonic_decreasing": is_monotonic_decreasing(curve)}, indent=2))
+    return 0
+
+
 class _CroppedSource:
     """Crops frames so the grid divides evenly."""
 
@@ -104,6 +124,12 @@ def build_parser() -> argparse.ArgumentParser:
     ev.add_argument("--fps", type=float, default=25.0)
     ev.add_argument("--score-field", default="global_max_pressure")
     ev.set_defaults(func=_cmd_eval)
+
+    oc = sub.add_parser("occlusion", help="detector degradation vs density")
+    oc.add_argument("counts", help="CSV with true_count,detected_count[,density_proxy]")
+    oc.add_argument("--out", required=True)
+    oc.add_argument("--bins", type=int, default=10)
+    oc.set_defaults(func=_cmd_occlusion)
     return parser
 
 
