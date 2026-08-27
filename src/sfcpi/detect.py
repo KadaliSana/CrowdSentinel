@@ -62,10 +62,21 @@ class YoloDetector:
         results = model(image, conf=self.conf, classes=self.classes, verbose=False)
         out: List[Detection] = []
         if not results:
-            return out
+            raise RuntimeError(
+                "YoloDetector: model returned no results (malformed output, "
+                "not a legitimate zero-detection frame)"
+            )
         boxes = results[0].boxes
-        if boxes is None or boxes.xyxy is None:
-            return out
+        if boxes is None:
+            raise RuntimeError(
+                "YoloDetector: results[0].boxes is None (malformed output, "
+                "not a legitimate zero-detection frame)"
+            )
+        if boxes.xyxy is None:
+            raise RuntimeError(
+                "YoloDetector: boxes.xyxy is None (malformed output, "
+                "not a legitimate zero-detection frame)"
+            )
         xyxy = boxes.xyxy.cpu().numpy()
         scores = boxes.conf.cpu().numpy() if boxes.conf is not None else np.ones(len(xyxy))
         for (x1, y1, x2, y2), s in zip(xyxy, scores):
