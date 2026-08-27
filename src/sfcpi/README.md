@@ -12,11 +12,38 @@ metres-per-pixel scale cancels exactly. Pressure computed in pixel space equals
 pressure in real units, given only the frame rate — see
 `docs/superpowers/specs/2026-08-27-sf-cpi-design.md`.
 
+## Install
+
+The package lives under `src/` (src layout), so it is not importable from a
+bare checkout. Install it once, from the repository root:
+
+    python3 -m pip install -e .
+
 ## Usage
 
     python3 -m sfcpi.cli run clip.mp4 --out metrics.jsonl --cell-size 64
-    python3 -m sfcpi.cli eval metrics.jsonl --labels labels.csv --fps 25
+    python3 -m sfcpi.cli eval metrics.jsonl --labels labels.csv
     python3 -m sfcpi.cli occlusion counts.csv --out curve.csv
+
+`eval` derives the frame rate from the `timestamp` column of the metrics file;
+pass `--fps` only to override it. It falls back to 25 fps, with a warning on
+stderr, when the timestamps are unusable — evaluating a 10 fps clip at an
+assumed 25 fps reports false alarms per hour 2.5x wrong.
+
+`eval` reports `n_frames`, `n_unscorable` and `coverage` alongside the scores.
+Read them first: a run whose detector was dead reports no false alarms simply
+because it never fired, and only `coverage` distinguishes "quiet" from "blind".
+False alarms are counted as contiguous alarm EPISODES, not as alarming frames —
+one 4-second alarm at 25 fps is one event, not 100.
+
+### Flow-only mode (`--no-detector`)
+
+`--no-detector` runs the optical-flow half alone. The count is then **unknown,
+not zero**: counts, density and pressure come out NaN (`null` in the JSONL) and
+`sensing_confidence` is `0.0`. Speed and velocity-variance metrics stay finite,
+because motion really was measured. This is the same fail-loud path the
+pipeline takes when a real detector throws — there is exactly one degradation
+semantics, not two.
 
 ## Design rules
 
@@ -26,7 +53,7 @@ pressure in real units, given only the frame rate — see
 
 ## Tests
 
-    python3 -m pytest
+    python3 -m pytest tests/sfcpi/ -q
 
 The scale-invariance property test in `tests/sfcpi/test_pressure.py` is the
 executable form of the paper's central claim. If it fails, the claim is wrong.

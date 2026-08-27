@@ -42,6 +42,26 @@ class FixedDetector:
         return self._detections
 
 
+class NullDetector:
+    """Flow-only mode: a detector that is explicitly ABSENT, not empty.
+
+    `FixedDetector([])` is the wrong tool here. It succeeds, so the pipeline's
+    degradation branch is never taken: counts come out 0, pressure comes out
+    0.0 and sensing_confidence comes out 1.0 -- full trust in the one mode that
+    measures no people at all. Raising routes flow-only runs through the
+    existing fail-loud path, where an unknown count is NaN and confidence is 0,
+    while mean_speed and velocity_variance stay finite. That is the same
+    semantics the detector-failure path already has, and there is exactly one
+    of it.
+    """
+
+    def detect(self, image: np.ndarray) -> List[Detection]:
+        raise RuntimeError(
+            "NullDetector: no detector configured (flow-only mode); "
+            "the count is unknown, not zero"
+        )
+
+
 class YoloDetector:
     """Ultralytics-backed detector. Loaded lazily so tests need no weights."""
 

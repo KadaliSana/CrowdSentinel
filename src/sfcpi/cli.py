@@ -5,7 +5,7 @@ import argparse
 import sys
 from typing import List, Optional
 
-from .detect import FixedDetector, YoloDetector
+from .detect import NullDetector, YoloDetector
 from .flow import FlowEstimator
 from .grid import CellGrid
 from .pipeline import Pipeline
@@ -20,7 +20,11 @@ def _cmd_run(args: argparse.Namespace) -> int:
     try:
         source = FileSource(args.video, max_frames=args.max_frames)
         first = next(iter(source))
-    except FileNotFoundError as exc:
+    except OSError as exc:
+        # OSError, not FileNotFoundError: sources.FileSource raises the bare
+        # parent for an existing-but-unopenable video (corrupt file, bad
+        # permissions). FileNotFoundError is a SUBCLASS, so catching only it
+        # let the corrupt-file case escape as a traceback. Both carry the path.
         print(f"error: {exc}", file=sys.stderr)
         return 2
     except StopIteration:
@@ -33,7 +37,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
     h -= h % cell
     grid = CellGrid(frame_width=w, frame_height=h, cell_size=cell)
 
-    detector = FixedDetector([]) if args.no_detector else YoloDetector(args.model, conf=args.conf)
+    detector = NullDetector() if args.no_detector else YoloDetector(args.model, conf=args.conf)
 
     pipeline = Pipeline(
         grid=grid,
@@ -158,7 +162,10 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--model", default="yolov8n.pt")
     run.add_argument("--conf", type=float, default=0.35)
     run.add_argument("--no-detector", action="store_true",
-                     help="flow-only run; counts are zero and pressure is zero")
+                     help="flow-only run: the count is UNKNOWN, so counts, "
+                          "density and pressure are NaN (null in the JSONL) "
+                          "and sensing_confidence is 0.0. Speed metrics stay "
+                          "finite. Counts are never reported as zero.")
     run.set_defaults(func=_cmd_run)
 
     ev = sub.add_parser("eval", help="score a metrics file against frame labels")
