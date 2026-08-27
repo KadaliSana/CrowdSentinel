@@ -1,0 +1,90 @@
+"""Command line entry points."""
+from __future__ import annotations
+
+import argparse
+import sys
+from typing import List, Optional
+
+from .detect import FixedDetector, YoloDetector
+from .flow import FlowEstimator
+from .grid import CellGrid
+from .pipeline import Pipeline
+from .sinks import JsonlSink
+from .sources import FileSource
+
+
+def _cmd_run(args: argparse.Namespace) -> int:
+    # FileSource probes fps at construction time (not first iteration), so a
+    # missing file raises FileNotFoundError from the constructor itself --
+    # the constructor must be inside the try, not just the first next().
+    try:
+        source = FileSource(args.video, max_frames=args.max_frames)
+        first = next(iter(source))
+    except FileNotFoundError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    except StopIteration:
+        print("error: video contained no frames", file=sys.stderr)
+        return 2
+
+    h, w = first.image.shape[:2]
+    cell = args.cell_size
+    w -= w % cell
+    h -= h % cell
+    grid = CellGrid(frame_width=w, frame_height=h, cell_size=cell)
+
+    detector = FixedDetector([]) if args.no_detector else YoloDetector(args.model, conf=args.conf)
+
+    pipeline = Pipeline(
+        grid=grid,
+        flow_estimator=FlowEstimator(downscale=args.downscale),
+        detector=detector,
+        fps=source.fps,
+    )
+
+    cropped = _CroppedSource(FileSource(args.video, max_frames=args.max_frames), w, h)
+    with JsonlSink(args.out) as sink:
+        for frame in pipeline.run(cropped):
+            sink.write(frame)
+    return 0
+
+
+class _CroppedSource:
+    """Crops frames so the grid divides evenly."""
+
+    def __init__(self, inner, width: int, height: int) -> None:
+        self._inner = inner
+        self._w, self._h = width, height
+        self.fps = inner.fps
+
+    def __iter__(self):
+        for frame in self._inner:
+            self.fps = self._inner.fps
+            yield type(frame)(frame.index, frame.timestamp, frame.image[: self._h, : self._w])
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="sfcpi")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    run = sub.add_parser("run", help="compute metrics for a video file")
+    run.add_argument("video")
+    run.add_argument("--out", required=True)
+    run.add_argument("--cell-size", type=int, default=64)
+    run.add_argument("--downscale", type=float, default=1.0)
+    run.add_argument("--max-frames", type=int, default=None)
+    run.add_argument("--model", default="yolov8n.pt")
+    run.add_argument("--conf", type=float, default=0.35)
+    run.add_argument("--no-detector", action="store_true",
+                     help="flow-only run; counts are zero and pressure is zero")
+    run.set_defaults(func=_cmd_run)
+    return parser
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    args = build_parser().parse_args(argv)
+    return args.func(args)
+
+
+if __name__ == "__main__":  # pragma: no cover
+    raise SystemExit(main())
