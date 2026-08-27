@@ -39,3 +39,6 @@ models/dataset/yolo26n.pt
 models/dataset/yolo26s.pt
 models/weights/*.onnx
 flash/Pro2_PG_tool_v1.4.3/flash_ntz.nn.bin
+
+# downloaded papers: copyrighted publisher PDFs, do not redistribute
+docs/litreview/pdfs/
