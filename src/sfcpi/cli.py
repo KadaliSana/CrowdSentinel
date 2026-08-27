@@ -49,6 +49,24 @@ def _cmd_run(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_eval(args: argparse.Namespace) -> int:
+    import json
+    import numpy as np
+    from .eval import evaluate, load_labels
+
+    scores = []
+    with open(args.metrics, encoding="utf-8") as fh:
+        for line in fh:
+            row = json.loads(line)
+            value = row.get(args.score_field)
+            scores.append(float("nan") if value is None else float(value))
+    labels = load_labels(args.labels)
+    n = min(len(scores), len(labels))
+    result = evaluate(np.array(scores[:n]), labels[:n], args.threshold, args.fps)
+    print(json.dumps(result, indent=2))
+    return 0
+
+
 class _CroppedSource:
     """Crops frames so the grid divides evenly."""
 
@@ -78,6 +96,14 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--no-detector", action="store_true",
                      help="flow-only run; counts are zero and pressure is zero")
     run.set_defaults(func=_cmd_run)
+
+    ev = sub.add_parser("eval", help="score a metrics file against frame labels")
+    ev.add_argument("metrics")
+    ev.add_argument("--labels", required=True)
+    ev.add_argument("--threshold", type=float, default=0.02)
+    ev.add_argument("--fps", type=float, default=25.0)
+    ev.add_argument("--score-field", default="global_max_pressure")
+    ev.set_defaults(func=_cmd_eval)
     return parser
 
 
