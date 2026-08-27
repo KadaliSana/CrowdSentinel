@@ -309,3 +309,213 @@ def test_interleaved_dropout_frames_surface_instead_of_going_silent():
     assert events, "alternating danger/dropout must not be silent"
     assert events[0].level is not RiskLevel.NORMAL
     assert events[0].reason in ("escalation", "sensor-blind")
+
+
+# --- C3 (cycle 3): the re-alert invariant, ENUMERATED over the reason space --
+#
+# Five unbounded-page defects have been found in this gate. Three consecutive
+# fixes each RELOCATED the spam rather than removing it, because each shipped
+# with a test written to that fix instead of to the property. The most recent
+# gated recovery->NORMAL and counted all reasons -- but drove a "fine" pressure
+# of 0.0, so it could only ever reach recovery->NORMAL and was structurally
+# blind to recovery->danger, which is where the spam had gone.
+#
+# These tests therefore enumerate rather than sample: every reason the machine
+# can emit is driven, by name, and the "fine" value is a parameter covering
+# both 0.0 (recovery -> NORMAL) and 0.025 (recovery -> HIGH).
+
+BLIND = float("nan")
+
+# Every reason RiskEvent documents. `sustained` is unreachable by construction
+# (equal severities cannot be different levels) and is marked pragma: no cover
+# in the machine; it is listed here so that adding a reason without extending
+# these tests fails loudly.
+DOCUMENTED_REASONS = {
+    "escalation", "de-escalation", "sustained", "sensor-blind", "recovery",
+}
+REACHABLE_REASONS = DOCUMENTED_REASONS - {"sustained"}
+
+# An emission may legitimately bypass min_realert_s by outranking the last
+# level the operator was told. That ladder is finite and monotone within a
+# window: NORMAL -> ELEVATED -> HIGH -> CRITICAL, plus the one blindness alert.
+# It is what separates "bounded by the clock" from "silent".
+LADDER_BYPASSES = 4
+
+
+def _drive(machine, duration, a, b, period=3.0, dt=0.5, t0=0.0):
+    """Alternate `period` seconds of input `a` / `period` seconds of `b`.
+
+    Returns (events, adoptions). `adoptions` counts every time the machine
+    ADOPTED a new level, whether or not it paged. It is the anti-vacuity
+    guard: it proves the drive genuinely traversed the transitions under test,
+    so a parameterisation that can never reach the interesting case -- the
+    exact defect the last three regression tests shipped with -- fails loudly
+    instead of passing empty.
+    """
+    events, adoptions, t = [], 0, t0
+    while t < t0 + duration:
+        before = machine.level
+        ev = machine.update(t, a if int((t - t0) // period) % 2 == 0 else b)
+        if machine.level is not before:
+            adoptions += 1
+        if ev is not None:
+            events.append(ev)
+        t += dt
+    return events, adoptions
+
+
+def _by_reason(events):
+    counts = {}
+    for e in events:
+        counts[e.reason] = counts.get(e.reason, 0) + 1
+    return counts
+
+
+def _max_pages_in_any_window(events, window):
+    """Most pages falling in any half-open interval of length `window`.
+
+    This is the LOCAL form of the invariant and the one worth asserting: a
+    global count over a long run legitimately grows with the number of
+    re-alert windows, which hides a per-flap leak inside a loose bound. The
+    per-window maximum does not grow with either the run length or the flap
+    rate, so it separates the two directly.
+    """
+    ts = [e.timestamp for e in events]
+    return max(
+        (sum(1 for x in ts if start <= x < start + window) for start in ts),
+        default=0,
+    )
+
+
+# (a, b, expected-per-reason counts) for a single 600s re-alert window.
+FLAP_CASES = [
+    pytest.param(
+        BLIND, 0.0, {"sensor-blind": 1},
+        id="blind-flap-recovering-to-normal",
+    ),
+    pytest.param(
+        # THE CASE THREE PREVIOUS TEST-WRITERS MISSED: a genuinely dense crowd
+        # with a flapping camera -- the likeliest real pairing. Every recovery
+        # lands on HIGH, not NORMAL, so `previous is UNKNOWN` -> reason
+        # "recovery" -> adopted is not NORMAL -> the old branch chain fired
+        # unconditionally, every single flap. Pre-fix: 19 pages in 113s at
+        # min_realert_s=600 (18 recovery + 1 sensor-blind), self-sustaining at
+        # period blind_alert_s + min_dwell_s.
+        BLIND, 0.025, {"sensor-blind": 1, "recovery": 1},
+        id="blind-flap-recovering-to-danger",
+    ),
+    pytest.param(
+        0.025, 0.0, {"escalation": 1},
+        id="measured-full-swing-high-to-normal",
+    ),
+    pytest.param(
+        0.05, 0.025, {"escalation": 1},
+        id="measured-swing-critical-to-high",
+    ),
+]
+
+
+@pytest.mark.parametrize("a,b,expected", FLAP_CASES)
+def test_no_reason_pages_more_than_the_realert_interval_allows(a, b, expected):
+    """Within ONE min_realert_s window, a flapping input pages a bounded
+    number of times -- bounded by the clock and the finite severity ladder,
+    never by the flap period.
+
+    Asserted per-reason as well as in total, so a future relocation of the
+    spam onto a different reason is caught BY NAME rather than hidden inside
+    an aggregate that happens to stay under a loose bound.
+    """
+    duration, realert = 113.0, 600.0
+    m = _m(min_dwell_s=2.0, min_realert_s=realert, blind_alert_s=2.0)
+    events, adoptions = _drive(m, duration, a, b)
+    counts = _by_reason(events)
+    labels = [e.reason for e in events]
+
+    # The drive must actually have flapped -- otherwise this test proves
+    # nothing, which is precisely how the previous regression tests passed.
+    assert adoptions >= 15, (
+        f"drive adopted only {adoptions} levels in {duration}s; it is not "
+        "exercising the flap and this assertion would be vacuous"
+    )
+
+    assert counts == expected, (
+        f"per-reason page counts changed: expected {expected}, got {counts} "
+        f"in {duration}s at min_realert_s={realert} (labels: {labels})"
+    )
+    assert len(events) == sum(expected.values()), (
+        f"total pages {len(events)} != {sum(expected.values())}: {labels}"
+    )
+    assert len(events) <= (1 + int(duration // realert)) + LADDER_BYPASSES, labels
+    # The whole point: pages track the clock, not the flap.
+    assert len(events) < adoptions, (
+        f"{len(events)} pages for {adoptions} adoptions -- still paging per flap"
+    )
+
+
+@pytest.mark.parametrize("a,b,expected", FLAP_CASES)
+def test_page_count_is_independent_of_how_long_the_flap_lasts(a, b, expected):
+    """Quadrupling the flap duration inside one re-alert window must not
+    change the page count at all. This is the truest statement of "bounded by
+    min_realert_s rather than by the flap period"."""
+    realert = 600.0
+    short, short_adoptions = _drive(
+        _m(min_dwell_s=2.0, min_realert_s=realert, blind_alert_s=2.0), 113.0, a, b
+    )
+    long, long_adoptions = _drive(
+        _m(min_dwell_s=2.0, min_realert_s=realert, blind_alert_s=2.0), 452.0, a, b
+    )
+    assert long_adoptions > short_adoptions, "the longer drive must flap more"
+    assert _by_reason(short) == _by_reason(long) == expected, (
+        f"page count grew with duration: {_by_reason(short)} -> {_by_reason(long)}"
+    )
+
+
+def test_every_reachable_reason_is_bounded_by_the_realert_interval():
+    """Enumerate the reason space, do not sample it.
+
+    A short min_realert_s over many windows so that EVERY reachable reason --
+    escalation, de-escalation, sensor-blind and recovery -- is actually
+    emitted at least once and can be bounded by name. The 600s tests above
+    pin the single-window behaviour; this one pins that no reason grows with
+    the flap once the clock does open.
+    """
+    duration, realert = 300.0, 20.0
+    observed = {}
+    for a, b in ((BLIND, 0.0), (BLIND, 0.025), (0.025, 0.0), (0.05, 0.025)):
+        m = _m(min_dwell_s=2.0, min_realert_s=realert, blind_alert_s=2.0)
+        events, adoptions = _drive(m, duration, a, b)
+        counts = _by_reason(events)
+        windows = 1 + int(duration // realert)
+        # Per window the clock may open once, and the severity ladder may be
+        # re-climbed from whatever the operator was last told. Across the run
+        # that budget repeats per window -- which is the definition of "gated
+        # by min_realert_s" -- so the tight assertion is the per-window one
+        # below, not this global cap.
+        per_window = 1 + LADDER_BYPASSES
+        assert set(counts) <= DOCUMENTED_REASONS, (
+            f"undocumented reason emitted: {set(counts) - DOCUMENTED_REASONS}"
+        )
+        assert _max_pages_in_any_window(events, realert) <= per_window, (
+            f"input ({a}, {b}) paged "
+            f"{_max_pages_in_any_window(events, realert)} times inside a single "
+            f"{realert}s window (cap {per_window}): {[e.reason for e in events]}"
+        )
+        for reason, n in counts.items():
+            assert n <= windows * per_window, (
+                f"reason {reason!r} paged {n} times in {duration}s at "
+                f"min_realert_s={realert} for input ({a}, {b})"
+            )
+        assert len(events) <= windows * per_window, (
+            f"{len(events)} total pages for input ({a}, {b}): "
+            f"{[e.reason for e in events]}"
+        )
+        assert len(events) < adoptions, "pages still track the flap period"
+        for reason, n in counts.items():
+            observed[reason] = observed.get(reason, 0) + n
+
+    missing = REACHABLE_REASONS - set(observed)
+    assert not missing, (
+        f"these reasons were never exercised, so nothing above bounds them: "
+        f"{sorted(missing)}. Add a case that reaches them rather than "
+        "narrowing the enumeration."
+    )

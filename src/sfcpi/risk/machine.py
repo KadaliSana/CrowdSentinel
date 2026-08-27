@@ -4,21 +4,57 @@ Three mechanisms, all required, because a raw threshold on a noisy signal
 flaps and at 15 fps that is tens of alerts a second:
   hysteresis  - separate rise/fall thresholds (in levels.classify)
   dwell       - a candidate level must persist before it is adopted
-  re-alert    - bypassed only when the candidate genuinely escalates PAST
-                the last level actually alerted (severity(candidate) >
-                severity(last_alerted_level)), or on the first-ever alert,
-                or on the FIRST sensor-blind alert, or on a recovery from
-                UNKNOWN straight to ELEVATED-or-worse (a sensor coming back
-                already showing danger must be heard). Re-escalating back up
-                to a level already alerted, any de-escalation, every
-                *subsequent* sensor-blind, and every recovery to NORMAL are
-                gated by time instead -- otherwise a slow full-swing
-                oscillation (HIGH -> NORMAL -> HIGH -> ...) or a flapping
-                camera (blind -> fine -> blind) would re-alert every dwell
-                period forever, at any min_realert_s. Note that closing one
-                of these bypasses tends to RELOCATE the spam onto whichever
-                is still open, so each is gated on the clock alone rather
-                than on a condition about the last alerted level.
+  re-alert    - the invariant below.
+
+THE RE-ALERT INVARIANT -- read this before touching the gate
+------------------------------------------------------------
+    An adopted level is emitted if and only if
+
+        min_realert_s has elapsed since the last emission
+        OR the adopted level strictly OUTRANKS `_last_alerted_level`
+           (what the operator was last actually told).
+
+That is ONE decision, implemented once, in `_outranks_last_alert`. It is
+deliberately NOT a chain of per-reason cases. This machine has had five
+separate unbounded-page defects, and every one of them was a special case
+added for one `reason` that left a bypass open for another: closing a
+bypass RELOCATES the spam onto whichever bypass is still open. A new case
+here is a new hole. If you are about to add `elif reason == ...` to the
+gate, you are reintroducing the defect.
+
+`reason` is a DISPLAY LABEL for the operator and nothing else. It must
+never appear in the gate. That separation is the property being defended.
+
+How UNKNOWN compares (it has no severity, so this is a decision, stated
+once, here and in `_outranks_last_alert`):
+
+  * `_last_alerted_level is None` -- nothing has ever been alerted, so
+    anything outranks it. The first event always fires.
+  * adopted IS UNKNOWN -- "the sensor is blind" is not a point on the
+    severity scale, it is a distinct incident. It outranks exactly once
+    (`_blind_alerted`): the FIRST blindness is always heard immediately,
+    even mid-window and even right after a danger page, because a sensor
+    dying is exactly when its silence matters. Every subsequent blindness
+    is time-gated, or a camera flapping blind/fine pages once per flap
+    forever.
+  * `_last_alerted_level` IS UNKNOWN -- a blind alert told the operator
+    nothing about severity, so it compares as severity 0. Any danger level
+    is therefore new information and is heard; an all-clear is not, and
+    waits for the clock.
+
+Consequence worth stating so it is not mistaken for a sixth leak: the ladder
+re-arms every time the clock opens. A blind/danger flap therefore costs up to
+one clock-opened page (the sensor-blind) plus one ladder ascent (the recovery
+to a danger level, which outranks the severity-0 UNKNOWN just alerted) per
+min_realert_s window -- at most `1 + ladder` pages per WINDOW, never per flap.
+That count is flat in the flap rate and in the run length; only the number of
+windows moves it, which is exactly what min_realert_s is for.
+
+Two pieces of state, and the difference between them is load-bearing:
+`self.level` is what the world IS (it advances on adoption, even when the
+emission is suppressed -- otherwise a suppressed blind never enters
+UNKNOWN and recovery is never detected); `_last_alerted_level` is what the
+operator has been TOLD. Only the second one gates.
 
 Dwell is tracked on TWO independent timers, because evidence for a level and
 absence of evidence are different things:
@@ -89,6 +125,35 @@ class RiskStateMachine:
         self._known_since = None
         self._known_floor = None
         self._unknown_since = None
+
+    # --- the re-alert invariant: exactly two predicates, no reason cases ---
+
+    def _realert_elapsed(self, t: float) -> bool:
+        """Has min_realert_s passed since the operator was last paged?"""
+        return (
+            self._last_alert_t is None
+            or (t - self._last_alert_t) >= self.min_realert_s
+        )
+
+    def _outranks_last_alert(self, adopted: RiskLevel) -> bool:
+        """Is `adopted` strictly worse news than what the operator was told?
+
+        The ONLY clock-independent reason to page. The UNKNOWN rules here are
+        the decisions described in the module docstring; keep the two in sync.
+        """
+        last = self._last_alerted_level
+        if last is None:
+            # Nothing has ever been alerted: the first event always fires.
+            return True
+        if adopted is RiskLevel.UNKNOWN:
+            # Blindness is off the severity scale: news exactly once, then
+            # time-gated, or a blind/fine flap pages once per flap forever.
+            return not self._blind_alerted
+        # A blind alert conveyed no severity, so it ranks as the floor: any
+        # danger level outranks it, an all-clear does not. (severity(UNKNOWN)
+        # is None and must never reach the comparison below.)
+        last_severity = 0 if last is RiskLevel.UNKNOWN else severity(last)
+        return severity(adopted) > last_severity
 
     def update(
         self, timestamp: float, pressure, coverage: Optional[float] = None
@@ -169,69 +234,17 @@ class RiskStateMachine:
             else:  # pragma: no cover - equal severities cannot differ in level
                 reason = "sustained"
 
-        # Re-alert gate.
-        if reason == "sensor-blind":
-            # A blind sensor is itself an incident, so the first one is heard
-            # immediately -- but only the first. A camera flapping blind/fine
-            # otherwise pages once per flap forever, because leaving UNKNOWN
-            # gates the all-clear and _last_alerted_level never advances past
-            # UNKNOWN, so the next blind period bypasses again.
-            if (
-                self._blind_alerted
-                and self._last_alert_t is not None
-                and (t - self._last_alert_t) < self.min_realert_s
-            ):
-                return None
-        elif reason == "recovery" and adopted is RiskLevel.NORMAL:
-            # Recovery to NORMAL is the resolution of a prior blind alert --
-            # gate it the same way as any other all-clear, on time ALONE.
-            #
-            # This deliberately does NOT also require
-            # `self._last_alerted_level is previous` (i.e. UNKNOWN). Gating
-            # repeat sensor-blinds means the blind alert is often suppressed,
-            # so `_last_alerted_level` sits at whatever was last actually
-            # paged -- a danger level -- while `self.level` is UNKNOWN. That
-            # identity check therefore failed and let the all-clear bypass
-            # min_realert_s; firing then set `_last_alerted_level = NORMAL`,
-            # which is equally not UNKNOWN, so the bypass re-armed itself and
-            # a blind/fine flap paged forever via `recovery` instead of via
-            # `sensor-blind`. Only the clock may open this gate.
-            if (
-                self._last_alert_t is not None
-                and (t - self._last_alert_t) < self.min_realert_s
-            ):
-                return None
-        elif reason == "recovery":
-            pass  # recovery straight to danger (ELEVATED+) always heard immediately
-        else:
-            # escalation / de-escalation: bypass only when the candidate
-            # genuinely escalates PAST the last level actually alerted.
-            # Equal or lower severity (including re-escalating back up to
-            # the same level) is gated by time instead.
-            cand_sev = severity(adopted)
-            if self._last_alerted_level is None:
-                escalates_past_last_alert = True  # first-ever alert
-            elif self._last_alerted_level is RiskLevel.UNKNOWN:
-                # A stale UNKNOWN here means the last thing the operator was
-                # told is "the sensor is blind" -- no danger level has been
-                # communicated at all. Any danger level is therefore new
-                # information and is heard; an all-clear is not, and waits.
-                # (severity(UNKNOWN) is None, so this must NOT fall through to
-                # the first-ever-alert branch, which would bypass the gate for
-                # de-escalations too.)
-                escalates_past_last_alert = cand_sev > 0
-            else:
-                escalates_past_last_alert = cand_sev > severity(self._last_alerted_level)
-            if not escalates_past_last_alert:
-                if (
-                    self._last_alert_t is not None
-                    and (t - self._last_alert_t) < self.min_realert_s
-                ):
-                    return None
+        # THE RE-ALERT GATE. One decision, no per-reason cases -- see the
+        # module docstring. `reason` is a label and must not appear here.
+        if not (self._realert_elapsed(t) or self._outranks_last_alert(adopted)):
+            return None
 
+        # Record what the operator has now been told. Keyed on the LEVEL, not
+        # on `reason` -- the label must have no mechanical role anywhere, or it
+        # starts drifting back into being the thing that decides.
         self._last_alerted_level = adopted
         self._last_alert_t = t
-        if reason == "sensor-blind":
+        if adopted is RiskLevel.UNKNOWN:
             self._blind_alerted = True
         p = (
             None
