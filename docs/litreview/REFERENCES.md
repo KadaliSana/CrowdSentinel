@@ -14,7 +14,7 @@
 
 | # | Reference | V |
 |---|---|---|
-| A1 | Johansson, A., Helbing, D., Al-Abideen, H.Z., Al-Bosta, S. *From Crowd Dynamics to Crowd Safety: A Video-Based Analysis.* Advances in Complex Systems, 2008. arXiv:0810.4590 — **defines crowd pressure = density x variance of speeds; critical 0.02 s^-2; flow < 0.8 ped/m/s** | [F] |
+| A1 | Johansson, A., Helbing, D., Al-Abideen, H.Z., Al-Bosta, S. *From Crowd Dynamics to Crowd Safety: A Video-Based Analysis.* Advances in Complex Systems, 2008. arXiv:0810.4590 — **defines crowd pressure = density x variance of VELOCITIES; critical 0.02 s^-2; flow < 0.8 ped/m/s**. NB: the body text says "variance of speeds" loosely, but the conclusions give the formal definition as "the density times the variance of velocities" — use the vector form; the two differ sharply under counterflow | [F] |
 | A2 | Helbing, D., Johansson, A., Al-Abideen, H.Z. *Crowd turbulence: The physics of crowd disasters.* 2007 | [M] |
 | A3 | Mehran, R., Oyama, A., Shah, M. *Abnormal Crowd Behavior Detection using Social Force Model.* CVPR 2009. https://ieeexplore.ieee.org/document/5206641/ — canonical baseline; UMN dataset | [M] |
 | A4 | Chan, A.B., Liang, Z.S.J., Vasconcelos, N. *Privacy preserving crowd monitoring: Counting people without people models or tracking.* CVPR 2008 | [M] |

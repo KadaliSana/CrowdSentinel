@@ -21,7 +21,7 @@ Johansson, Helbing, Al-Abideen & Al-Bosta [A1], analysing video of the 2006 Jama
 disaster, tested density, speed, flow, divergence and curl and found **none** of them
 identified the accident. The quantity that did was *crowd pressure*:
 
-    P = rho * Var(v)        (density times the variance of speeds)
+    P = rho * Var(v)        (density times the variance of VELOCITIES, i.e. Var(vx)+Var(vy))
 
 Turbulent crowd motion began when P exceeded **0.02 s^-2**, roughly **10 minutes before**
 the crush; average flow had dropped below **0.8 ped/m/s** more than **30 minutes** before
