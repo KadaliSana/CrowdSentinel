@@ -17,11 +17,10 @@ from __future__ import annotations
 import base64
 import binascii
 import json
-from datetime import datetime
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
-from botocore.auth import SIGV4_TIMESTAMP, SigV4QueryAuth
+from botocore.auth import SigV4QueryAuth
 from botocore.awsrequest import AWSRequest
 
 
@@ -146,7 +145,6 @@ def sign_wss_url(
     credentials: Any,
     client_id: str | None = None,
     expires: int = 299,
-    timestamp: datetime | None = None,
 ) -> str:
     """SigV4 *query-string* (presigned) sign a KVS viewer WebSocket URL.
 
@@ -158,16 +156,29 @@ def sign_wss_url(
     `X-Amz-SignedHeaders` and `X-Amz-Signature` (plus `X-Amz-Security-Token`
     if `credentials` carries a session token).
 
-    Signing is delegated to `botocore.auth.SigV4QueryAuth` -- canonicalisation
-    and percent-encoding are easy to get subtly wrong by hand. The signature
-    covers the request's host and path, not its scheme, so this signs the
-    `https://` form of `wss_endpoint` and returns the result with the `wss://`
-    scheme restored.
+    Signing is delegated to `botocore.auth.SigV4QueryAuth.add_auth()` -- the
+    library's PUBLIC entry point, not its internal signing steps.
+    Canonicalisation and percent-encoding are easy to get subtly wrong by
+    hand, and calling internal helpers (`_modify_request_before_signing`,
+    `canonical_request`, `string_to_sign`, `signature`,
+    `_inject_signature_to_request`) directly ties this module to botocore
+    internals that carry no compatibility guarantee -- a botocore upgrade
+    could change or reorder them and this would break silently in production
+    (the one path with no test coverage), while any test built against the
+    same internals would happily stay green. `add_auth()` is public and
+    stable; the only friction it adds is that it always timestamps the
+    request from the real current time with no override parameter. Tests get
+    a deterministic signature by freezing the clock botocore itself reads
+    (patch `botocore.auth.get_current_datetime`), not by threading a
+    timestamp through this function -- see `tests/sfcpi/test_webrtc_signing.py`.
+
+    The signature covers the request's host and path, not its scheme, so
+    this signs the `https://` form of `wss_endpoint` and returns the result
+    with the `wss://` scheme restored.
 
     `credentials` is a botocore-style credentials object (`.access_key`,
     `.secret_key`, and optional `.token`) -- always injected, never fetched
-    here. `timestamp` is injectable (defaults to now, UTC) so callers/tests
-    get a deterministic, reproducible signature.
+    here.
     """
     if not wss_endpoint:
         raise ValueError("wss_endpoint must be a non-empty string")
@@ -182,19 +193,8 @@ def sign_wss_url(
         params["X-Amz-ClientId"] = client_id
 
     request = AWSRequest(method="GET", url=https_url, params=params)
-    ts = timestamp if timestamp is not None else datetime.utcnow()
-    # SigV4Auth.add_auth() (the usual entry point) always stamps
-    # request.context['timestamp'] from datetime.now() itself, with no way to
-    # override it -- so this calls the same steps add_auth() would, in order,
-    # but with an injected timestamp, to keep signing deterministic for tests.
-    request.context["timestamp"] = ts.strftime(SIGV4_TIMESTAMP)
-
     auth = SigV4QueryAuth(credentials, "kinesisvideo", region, expires=expires)
-    auth._modify_request_before_signing(request)
-    canonical_request = auth.canonical_request(request)
-    string_to_sign = auth.string_to_sign(request, canonical_request)
-    signature = auth.signature(string_to_sign, request)
-    auth._inject_signature_to_request(request, signature)
+    auth.add_auth(request)
 
     signed = urlsplit(request.url)
     return urlunsplit(("wss", signed.netloc, signed.path, signed.query, ""))

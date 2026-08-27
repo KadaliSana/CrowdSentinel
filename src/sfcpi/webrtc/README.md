@@ -59,23 +59,35 @@ signing is actually possible and needed:
   `KvsSignalingClient` where `channel_arn` is set but no credentials can be found anywhere,
   `connect()` raises `RuntimeError` before opening any socket, rather than silently
   attempting an unsigned (and certain-to-fail) connection.
-- Signing itself is delegated to `botocore.auth.SigV4QueryAuth` against a
+- Signing itself is delegated to `botocore.auth.SigV4QueryAuth.add_auth()` against a
   `botocore.awsrequest.AWSRequest` (service `kinesisvideo`) -- not hand-rolled HMAC --
-  because canonicalisation and percent-encoding are easy to get subtly wrong by hand. The
-  signature covers the request's host and path, not its scheme: `sign_wss_url` signs the
-  `https://` form of the endpoint and returns the result with the `wss://` scheme restored.
+  because canonicalisation and percent-encoding are easy to get subtly wrong by hand.
+  `add_auth()` is deliberately the library's **public** entry point, not its internal
+  signing steps (`_modify_request_before_signing` / `canonical_request` / `string_to_sign`
+  / `signature` / `_inject_signature_to_request`) called directly: those carry no
+  compatibility guarantee, and production code depending on them purely to make tests
+  deterministic would mean a botocore upgrade could silently break real signing while CI
+  stayed green. The signature covers the request's host and path, not its scheme:
+  `sign_wss_url` signs the `https://` form of the endpoint and returns the result with the
+  `wss://` scheme restored.
 
 **Verified by `tests/sfcpi/test_webrtc_signing.py` (network-free, no real credentials --
-uses `botocore.credentials.Credentials("AKIDEXAMPLE", ...)` and a frozen timestamp):** the
+uses `botocore.credentials.Credentials("AKIDEXAMPLE", ...)`):** the
 signed URL keeps the `wss://` scheme, host and path; all six presign params
 (`X-Amz-Algorithm`, `X-Amz-Credential`, `X-Amz-Date`, `X-Amz-Expires`, `X-Amz-SignedHeaders`,
 `X-Amz-Signature`) are present; `X-Amz-ChannelARN` is present and correctly percent-encoded;
-`X-Amz-ClientId` appears iff a `client_id` is given; signing twice with the same frozen
-timestamp is byte-identical (determinism); **changing the channel ARN with everything else
-fixed changes `X-Amz-Signature`** (proof the signature actually covers the request, not a
-constant); a session token on the credentials appears as `X-Amz-Security-Token`; and an
-empty `wss_endpoint` or `channel_arn` raises `ValueError` naming the missing field. Also
-manually verified (not committed, no assertions, just a wiring smoke check) that
+`X-Amz-ClientId` appears iff a `client_id` is given; signing twice under a frozen clock is
+byte-identical (determinism); **changing the channel ARN with everything else fixed changes
+`X-Amz-Signature`** (proof the signature actually covers the request, not a constant); a
+session token on the credentials appears as `X-Amz-Security-Token`; and an empty
+`wss_endpoint` or `channel_arn` raises `ValueError` naming the missing field. Determinism
+comes from an autouse fixture that freezes the clock `add_auth()` itself reads
+(`botocore.auth.get_current_datetime`, monkeypatched) rather than from a timestamp parameter
+threaded through `sign_wss_url` -- `sign_wss_url` has no such parameter, so production always
+signs against the real current time, and the one remaining dependency on a botocore internal
+lives in the test file, guarded by its own canary test (`test_canary_botocore_auth_still_exposes_get_current_datetime`)
+so a rename/removal fails loudly in CI instead of silently in production. Also manually
+verified (not committed, no assertions, just a wiring smoke check) that
 `WebRTCSource.connect()` actually passes the *signed* URL to `websockets.connect(...)`
 against a fake `kinesisvideo` client, and that omitting credentials against a real
 `channel_arn` with no AWS credentials configured anywhere raises the `RuntimeError` above

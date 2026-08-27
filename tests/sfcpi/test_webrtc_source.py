@@ -52,3 +52,18 @@ def test_dropped_frames_are_counted_and_visible():
     s.close()
     list(s)
     assert s.dropped > 0
+
+def test_warmup_frames_1_survives_the_first_feed():
+    """warmup_frames=1 is a legal constructor value; a single timestamp gives
+    zero inter-frame deltas, so the first feed() must not raise
+    StatisticsError -- fps just isn't available yet."""
+    s = _src(warmup_frames=1)
+    s.feed(_img(), timestamp=0.0)
+    with pytest.raises(RuntimeError, match="fps"):
+        _ = s.fps
+
+def test_warmup_frames_1_fps_available_and_correct_after_second_frame():
+    s = _src(warmup_frames=1)
+    s.feed(_img(0), timestamp=0.0)
+    s.feed(_img(1), timestamp=0.1)     # 10 fps
+    assert s.fps == pytest.approx(10.0, rel=0.05)

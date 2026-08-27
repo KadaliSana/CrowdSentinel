@@ -3,10 +3,11 @@ replay sources in sfcpi.sources, so the pipeline consumes both identically.
 
 Frames arrive on aiortc's asyncio loop via feed(); the pipeline consumes them
 synchronously via __iter__. FrameBridge is the bounded, drop-oldest handoff
-between the two. fps is measured from the first `warmup_frames` timestamps
-(median inter-frame delta) and RAISES until that warm-up completes -- frame
-rate feeds crowd pressure as fps**2, so a silent default would be a quadratic
-error, not a rounding error.
+between the two. fps is measured from the first `max(warmup_frames, 2)`
+timestamps (median inter-frame delta -- at least two timestamps are needed to
+produce even one delta, so warmup_frames=1 still waits for a second frame)
+and RAISES until that warm-up completes -- frame rate feeds crowd pressure as
+fps**2, so a silent default would be a quadratic error, not a rounding error.
 
 aiortc is imported lazily, inside the connect path only, so importing this
 module (and running these tests) never requires it to be installed.
@@ -72,10 +73,20 @@ class WebRTCSource:
     def fps(self) -> float:
         if self._fps is None:
             raise RuntimeError(
-                f"fps not yet measured: need {self.warmup_frames} frames to "
-                f"warm up, have {len(self._warmup_timestamps)}"
+                f"fps not yet measured: need {self._effective_warmup_frames} "
+                f"frames to warm up, have {len(self._warmup_timestamps)}"
             )
         return self._fps
+
+    @property
+    def _effective_warmup_frames(self) -> int:
+        # A single timestamp produces zero inter-frame deltas, so
+        # statistics.median([]) has nothing to work with. warmup_frames=1 is
+        # a legal constructor value (it means "don't make me wait long for
+        # fps"), so silently need a second timestamp instead of raising
+        # StatisticsError on the very first feed() -- fps still never
+        # becomes available a frame earlier than the math allows.
+        return max(self.warmup_frames, 2)
 
     @property
     def dropped(self) -> int:
@@ -115,7 +126,7 @@ class WebRTCSource:
         if self._fps is not None:
             return
         self._warmup_timestamps.append(float(timestamp))
-        if len(self._warmup_timestamps) >= self.warmup_frames:
+        if len(self._warmup_timestamps) >= self._effective_warmup_frames:
             deltas = [
                 b - a
                 for a, b in zip(self._warmup_timestamps, self._warmup_timestamps[1:])
