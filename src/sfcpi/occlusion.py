@@ -58,11 +58,17 @@ def detection_rate_curve(points: List[DetectionRatePoint], n_bins: int = 10) -> 
 def is_monotonic_decreasing(df: pd.DataFrame, tolerance: float = 0.05) -> bool:
     """True if the detection ratio falls consistently with density.
 
-    Tolerance permits small non-monotonic wobble; anything larger means the
-    curve is not stable enough to invert into a correction.
+    Two conditions, both necessary:
+      - no bin-to-bin INCREASE larger than `tolerance` (permits small wobble), and
+      - a genuine NET decrease from the first finite bin to the last.
+
+    The net-decrease term is essential: bounding only the rise would certify a
+    steadily RISING curve as "decreasing" and invert the conclusion this rule gates.
     """
     values = df["mean_ratio"].to_numpy(dtype=float)
     values = values[np.isfinite(values)]
     if values.size < 2:
         return False
-    return bool(np.all(np.diff(values) <= tolerance))
+    no_large_rise = np.all(np.diff(values) <= tolerance)
+    net_decrease = (values[0] - values[-1]) > tolerance
+    return bool(no_large_rise and net_decrease)

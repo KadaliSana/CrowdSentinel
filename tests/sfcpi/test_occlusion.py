@@ -38,3 +38,21 @@ def test_noisy_curve_is_rejected():
 def test_empty_points_raise():
     with pytest.raises(ValueError, match="no points"):
         detection_rate_curve([], n_bins=4)
+
+def test_steadily_rising_curve_is_not_monotonic_decreasing():
+    """A rise of 0.04/bin stays under the 0.05 tolerance but is the OPPOSITE
+    of degradation; certifying it would invert the research conclusion."""
+    df = detection_rate_curve(_points([(10, 0.10), (50, 0.14), (100, 0.18), (150, 0.22)]), n_bins=4)
+    assert is_monotonic_decreasing(df) is False
+
+def test_flat_curve_is_not_monotonic_decreasing():
+    """No degradation at all must not be certified as a decreasing trend."""
+    df = detection_rate_curve(_points([(10, 0.5), (50, 0.5), (100, 0.5), (150, 0.5)]), n_bins=4)
+    assert is_monotonic_decreasing(df) is False
+
+def test_wobbly_but_net_falling_curve_is_accepted():
+    """A slight mid-curve upward wobble within tolerance, with a substantial
+    overall fall, must still be accepted -- the fix must not become a
+    strictly-decreasing rule that loses the tolerance's purpose."""
+    df = detection_rate_curve(_points([(10, 0.90), (50, 0.85), (100, 0.87), (150, 0.50)]), n_bins=4)
+    assert is_monotonic_decreasing(df) is True
