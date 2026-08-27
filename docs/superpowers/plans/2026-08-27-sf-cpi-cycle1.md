@@ -1,5 +1,15 @@
 # SF-CPI Cycle 1 Implementation Plan
 
+> **HISTORICAL RECORD — superseded in part. Do not read as current spec.**
+> This plan is kept as-written to preserve what was specified and where it was wrong.
+> Two of its instructions were defects caught in review and corrected in the shipped code:
+> - it specifies `speed_variance` (variance of speed MAGNITUDES); the shipped code uses
+>   `velocity_variance` = `Var(vx) + Var(vy)`, per Johansson/Helbing's actual definition.
+>   Magnitude variance is 0 under counterflow, i.e. zero pressure in the turbulence regime.
+> - its "scale invariance" test was algebraically tautological; the shipped test scales the
+>   implementation's own inputs instead.
+> Current authority: `docs/superpowers/specs/2026-08-27-sf-cpi-design.md` and the code.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Build a replay-first pipeline that computes scale-free crowd pressure from uncalibrated video, plus the evaluation harness and the occlusion characterisation experiment.
