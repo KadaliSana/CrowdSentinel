@@ -7,13 +7,18 @@ flaps and at 15 fps that is tens of alerts a second:
   re-alert    - bypassed only when the candidate genuinely escalates PAST
                 the last level actually alerted (severity(candidate) >
                 severity(last_alerted_level)), or on the first-ever alert,
-                or on the FIRST sensor-blind alert. Re-escalating back up to
-                a level already alerted, any de-escalation, and every
-                *subsequent* sensor-blind are gated by time instead --
-                otherwise a slow full-swing oscillation (HIGH -> NORMAL ->
-                HIGH -> ...) or a flapping camera (blind -> fine -> blind)
-                would re-alert every dwell period forever, at any
-                min_realert_s.
+                or on the FIRST sensor-blind alert, or on a recovery from
+                UNKNOWN straight to ELEVATED-or-worse (a sensor coming back
+                already showing danger must be heard). Re-escalating back up
+                to a level already alerted, any de-escalation, every
+                *subsequent* sensor-blind, and every recovery to NORMAL are
+                gated by time instead -- otherwise a slow full-swing
+                oscillation (HIGH -> NORMAL -> HIGH -> ...) or a flapping
+                camera (blind -> fine -> blind) would re-alert every dwell
+                period forever, at any min_realert_s. Note that closing one
+                of these bypasses tends to RELOCATE the spam onto whichever
+                is still open, so each is gated on the clock alone rather
+                than on a condition about the last alerted level.
 
 Dwell is tracked on TWO independent timers, because evidence for a level and
 absence of evidence are different things:
@@ -168,9 +173,9 @@ class RiskStateMachine:
         if reason == "sensor-blind":
             # A blind sensor is itself an incident, so the first one is heard
             # immediately -- but only the first. A camera flapping blind/fine
-            # otherwise pages once per flap forever: leaving UNKNOWN gates the
-            # all-clear, so _last_alerted_level stays UNKNOWN and the next
-            # blind period bypasses again.
+            # otherwise pages once per flap forever, because leaving UNKNOWN
+            # gates the all-clear and _last_alerted_level never advances past
+            # UNKNOWN, so the next blind period bypasses again.
             if (
                 self._blind_alerted
                 and self._last_alert_t is not None
@@ -179,10 +184,20 @@ class RiskStateMachine:
                 return None
         elif reason == "recovery" and adopted is RiskLevel.NORMAL:
             # Recovery to NORMAL is the resolution of a prior blind alert --
-            # gate it the same way as any other all-clear.
+            # gate it the same way as any other all-clear, on time ALONE.
+            #
+            # This deliberately does NOT also require
+            # `self._last_alerted_level is previous` (i.e. UNKNOWN). Gating
+            # repeat sensor-blinds means the blind alert is often suppressed,
+            # so `_last_alerted_level` sits at whatever was last actually
+            # paged -- a danger level -- while `self.level` is UNKNOWN. That
+            # identity check therefore failed and let the all-clear bypass
+            # min_realert_s; firing then set `_last_alerted_level = NORMAL`,
+            # which is equally not UNKNOWN, so the bypass re-armed itself and
+            # a blind/fine flap paged forever via `recovery` instead of via
+            # `sensor-blind`. Only the clock may open this gate.
             if (
-                self._last_alerted_level is previous
-                and self._last_alert_t is not None
+                self._last_alert_t is not None
                 and (t - self._last_alert_t) < self.min_realert_s
             ):
                 return None

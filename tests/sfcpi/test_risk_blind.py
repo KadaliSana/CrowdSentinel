@@ -134,6 +134,58 @@ def test_flap_page_count_does_not_grow_with_flap_duration():
     assert len([e for e in long if e.reason == "sensor-blind"]) == 1
 
 
+def test_flapping_after_a_danger_alert_does_not_page_via_recovery():
+    """C2, hole #4: the repeat-blind gate RELOCATED the flap spam onto
+    `recovery`.
+
+    Gating the second and later sensor-blind alerts leaves
+    `_last_alerted_level` at whatever was last actually paged -- a DANGER
+    level, not UNKNOWN -- while `self.level` is UNKNOWN. The old
+    recovery-to-NORMAL gate keyed on `_last_alerted_level is previous`
+    (i.e. UNKNOWN), so that identity check failed and every all-clear
+    bypassed `min_realert_s` outright. Worse, firing set
+    `_last_alerted_level = NORMAL`, which is *also* not UNKNOWN -- so the
+    bypass re-armed itself and the flap paged forever.
+
+    Priming matters: the two older C2 tests start from a pure flap (where
+    `_last_alerted_level` stays UNKNOWN, so the identity check happened to
+    hold) and then filter to `reason == "sensor-blind"`, which discards
+    exactly the pages this leak produces. So: prime with one blind period
+    and a recovery straight to HIGH, then flap, then count EVERY reason.
+
+    Measured on the pre-fix machine: 18 pages in 113s at min_realert_s=600.
+    """
+    realert = 600.0
+    m = _m(min_dwell_s=2.0, min_realert_s=realert, blind_alert_s=2.0)
+
+    # Prime: _last_alerted_level must end up a DANGER level, not UNKNOWN.
+    m.update(0.0, 0.0)
+    m.update(1.0, float("nan"))
+    assert m.update(3.5, float("nan")) is not None          # -> UNKNOWN, blind fires
+    m.update(4.0, 0.025)
+    primed = m.update(6.5, 0.025)                            # -> HIGH, recovery fires
+    assert primed is not None and primed.level is RiskLevel.HIGH
+    assert m._last_alerted_level is RiskLevel.HIGH
+
+    # 3s blind / 3s fine, for ~113s -- well inside a single 600s window.
+    duration, t0 = 113.0, 6.5
+    events, t = [], t0
+    while t < t0 + duration:
+        blind = int((t - t0) // 3.0) % 2 == 0
+        ev = m.update(t, float("nan") if blind else 0.0)
+        if ev is not None:
+            events.append(ev)
+        t += 0.5
+
+    # Count ALL reasons. Filtering to "sensor-blind" is what hid this.
+    bound = 1 + int(duration // realert)
+    assert len(events) <= bound, (
+        f"expected at most {bound} page(s) of ANY reason in {duration}s at "
+        f"min_realert_s={realert}, got {len(events)}: "
+        f"{[e.reason for e in events]}"
+    )
+
+
 def test_the_first_blind_alert_is_never_swallowed():
     """Gating subsequent blinds must not mute the first one: a sensor dying
     right after a danger alert is exactly when its silence matters."""
