@@ -25,7 +25,7 @@ def frame_to_row(frame: MetricsFrame) -> Dict[str, Any]:
         "global_pressure": _clean(frame.global_pressure),
         "global_max_pressure": _clean(frame.global_max_pressure),
         "total_count": _clean(frame.total_count),
-        "sensing_confidence": frame.sensing_confidence,
+        "sensing_confidence": _clean(frame.sensing_confidence),
         "cell_pressure": [] if pressure is None else
                          [[_clean(float(v)) for v in row] for row in np.asarray(pressure)],
     }
