@@ -4,8 +4,11 @@ Three mechanisms, all required, because a raw threshold on a noisy signal
 flaps and at 15 fps that is tens of alerts a second:
   hysteresis  - separate rise/fall thresholds (in levels.classify)
   dwell       - a candidate level must persist before it is adopted
-  re-alert    - a level already alerted does not re-alert until it escalates
-                past it or min_realert_s has elapsed
+  re-alert    - escalation always bypasses this interval (getting worse must
+                always be heard immediately); de-escalation is gated by it,
+                keyed on the level being stepped down from, so an
+                oscillating signal cannot emit alternating alert / all-clear
+                pairs forever
 
 Dwell tracks divergence from the *adopted* level (self.level), not the exact
 candidate value. A noisy signal straddling a boundary (e.g. flapping between
@@ -93,19 +96,21 @@ class RiskStateMachine:
         else:  # pragma: no cover - equal severities cannot differ in level
             reason = "sustained"
 
-        # Re-alert gate: only guards against re-raising the alarm for a level
-        # that was already alerted recently. De-escalations (the all-clear)
-        # are never gated -- they report the resolution of a prior alert, not
-        # a duplicate of it.
-        if reason != "de-escalation":
+        # Re-alert gate: escalation ("getting worse") must always be heard
+        # immediately, so it always bypasses the interval -- even back up to
+        # a level that was already alerted. De-escalation (the all-clear) is
+        # gated instead, keyed on the level being stepped down FROM: without
+        # this, an oscillating signal emits alternating alert / all-clear
+        # pairs forever, which defeats the anti-spam purpose of this gate.
+        if reason == "de-escalation":
             if (
-                self._last_alerted_level is candidate
+                self._last_alerted_level is previous
                 and self._last_alert_t is not None
                 and (t - self._last_alert_t) < self.min_realert_s
             ):
                 return None
-            self._last_alerted_level = candidate
 
+        self._last_alerted_level = candidate
         self._last_alert_t = t
         p = None if pressure is None or not math.isfinite(float(pressure)) else float(pressure)
         message = (

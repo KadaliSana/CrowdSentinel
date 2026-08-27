@@ -56,7 +56,11 @@ def test_pressure_and_coverage_ride_on_the_event():
     assert ev.coverage == pytest.approx(0.8)
 
 def test_de_escalation_is_reported():
-    m = _machine()
+    """De-escalation still respects the re-alert interval (see
+    test_risk_blind.py::test_de_escalation_respects_the_realert_interval) --
+    use a short interval here so the all-clear at t=6.5 (3.5s after the
+    alert) genuinely falls outside it, rather than testing an exemption."""
+    m = _machine(min_realert_s=1.0)
     m.update(0.0, 0.0)
     m.update(1.0, 0.025)
     m.update(3.0, 0.025)                      # -> HIGH
