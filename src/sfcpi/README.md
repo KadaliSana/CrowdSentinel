@@ -48,7 +48,8 @@ semantics, not two.
 
 ### `watch` — replay metrics through the risk state machine
 
-    python3 -m sfcpi.cli watch metrics.jsonl --threshold-high 0.02 --min-dwell 2.0 --blind-alert 30.0
+    python3 -m sfcpi.cli watch metrics.jsonl --threshold-high 0.02 --min-dwell 2.0 \
+        --blind-alert 30.0 --min-coverage 0.0
 
 Reads a `sfcpi run` JSONL metrics file line by line and feeds `--score-field`
 (default `global_max_pressure`) through the hysteresis + dwell + re-alert
@@ -66,6 +67,24 @@ reading.
 its own `--blind-alert` (default 30.0s, matching the library default) so a
 brief camera glitch does not page someone at the same eagerness as a real
 crowd-pressure escalation.
+
+`--min-coverage` (default `0.0`, disabled) sets the minimum
+`sensing_confidence` fraction for a row to be scored at all. Below it the
+row is fed to the state machine as unscorable (`UNKNOWN`), not as the
+`0.0` pressure the dropped-out detector actually reported — a face
+detector losing the crowd is a legitimate reading of ~0 pressure, so
+scoring it produces a falsely-calm `NORMAL` and the dense-crowd signature
+becomes silence. With the flag set, that pattern surfaces as a
+`sensor-blind` alert after `--blind-alert`. The default of `0.0` changes
+nothing, so raising it is an explicit opt-in tied to how much of the frame
+your detector can be expected to sense.
+
+Bad settings fail with `error: ...` and a non-zero exit, never a
+traceback: a `--threshold-high` that crosses the (unexposed) critical tier,
+a negative duration or an out-of-range `--min-coverage`, a non-positive
+`--fps` used for timestamp synthesis, and a row whose `timestamp` is a
+non-finite JSON literal (`NaN`/`Infinity` — `json.loads` accepts these, so
+they get past the JSON parse) are all reported naming the offending input.
 
 A row missing the `timestamp` key is never silently treated as `t=0.0`
 (every row would then collide at the same instant, dwell would never

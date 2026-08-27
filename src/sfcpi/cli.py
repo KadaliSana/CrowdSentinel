@@ -118,6 +118,7 @@ def _cmd_eval(args: argparse.Namespace) -> int:
 
 def _cmd_watch(args: argparse.Namespace) -> int:
     import json
+    import math
 
     from .risk.levels import Thresholds
     from .risk.machine import RiskStateMachine
@@ -144,16 +145,25 @@ def _cmd_watch(args: argparse.Namespace) -> int:
     # Only --threshold-high is exposed on the CLI; keep the default ratio
     # between rise/fall (0.8, from the Thresholds defaults 0.016/0.020) so a
     # custom --threshold-high still satisfies the hysteresis invariant.
-    thresholds = Thresholds(
-        high_rise=args.threshold_high, high_fall=args.threshold_high * 0.8
-    )
-
-    machine = RiskStateMachine(
-        thresholds,
-        min_dwell_s=args.min_dwell,
-        min_realert_s=args.min_realert,
-        blind_alert_s=args.blind_alert,
-    )
+    #
+    # Both constructions validate their arguments and raise ValueError -- e.g.
+    # --threshold-high 0.05 crosses the (unexposed) critical tier, which is
+    # exactly the mistake the cross-tier check exists to catch. A traceback is
+    # not an error message: name the offending flag and exit non-zero.
+    try:
+        thresholds = Thresholds(
+            high_rise=args.threshold_high, high_fall=args.threshold_high * 0.8
+        )
+        machine = RiskStateMachine(
+            thresholds,
+            min_dwell_s=args.min_dwell,
+            min_realert_s=args.min_realert,
+            blind_alert_s=args.blind_alert,
+            min_coverage=args.min_coverage,
+        )
+    except ValueError as exc:
+        print(f"error: invalid risk settings: {exc}", file=sys.stderr)
+        return 2
 
     try:
         with open(args.metrics, encoding="utf-8") as fh:
@@ -193,6 +203,18 @@ def _cmd_watch(args: argparse.Namespace) -> int:
             synth_fps = _fps_from_timestamps(raw_timestamps)
         if synth_fps is None:
             synth_fps = DEFAULT_EVAL_FPS
+        # Zero divides; negative or non-finite is WORSE than a crash -- it
+        # synthesises decreasing (or NaN) timestamps, which the state machine
+        # reads as a clock reset on every row, so the file replays as a
+        # silent, alert-free "calm crowd". Refuse it.
+        if not math.isfinite(synth_fps) or synth_fps <= 0:
+            print(
+                f"error: --fps must be a finite frame rate greater than zero, "
+                f"got {synth_fps!r}; it is used to synthesise timestamps for "
+                f"the {n_missing} row(s) in {args.metrics} that have none",
+                file=sys.stderr,
+            )
+            return 2
         print(
             f"warning: {n_missing} row(s) in {args.metrics} have no timestamp; "
             f"synthesising timestamps from --fps {synth_fps} and row index -- "
@@ -202,14 +224,26 @@ def _cmd_watch(args: argparse.Namespace) -> int:
         )
 
     for idx, row in enumerate(rows):
-        value = row.get(args.score_field)
-        pressure = float("nan") if value is None else float(value)
-        ts = row.get("timestamp")
-        timestamp = (idx / synth_fps) if ts is None else float(ts)
-        coverage_raw = row.get("sensing_confidence")
-        coverage = None if coverage_raw is None else float(coverage_raw)
+        # `json.loads` accepts the bare literals NaN/Infinity, so a
+        # non-finite timestamp reaches here having survived the
+        # JSONDecodeError handler above; the state machine then rejects it
+        # (a NaN time defeats the dwell AND re-alert gates at once). Report
+        # it like any other bad input, naming the row.
+        try:
+            value = row.get(args.score_field)
+            pressure = float("nan") if value is None else float(value)
+            ts = row.get("timestamp")
+            timestamp = (idx / synth_fps) if ts is None else float(ts)
+            coverage_raw = row.get("sensing_confidence")
+            coverage = None if coverage_raw is None else float(coverage_raw)
 
-        event = machine.update(timestamp, pressure, coverage=coverage)
+            event = machine.update(timestamp, pressure, coverage=coverage)
+        except (ValueError, TypeError) as exc:
+            print(
+                f"error: {args.metrics}: row {idx + 1}: {exc}",
+                file=sys.stderr,
+            )
+            return 2
         if event is not None:
             for sink in sinks:
                 sink.publish(event)
@@ -310,6 +344,13 @@ def build_parser() -> argparse.ArgumentParser:
                             f"from the metrics file's other timestamps, falling back "
                             f"to {DEFAULT_EVAL_FPS}. A missing timestamp always prints "
                             "a warning; it is never silently treated as t=0.")
+    watch.add_argument("--min-coverage", type=float, default=0.0,
+                       help="minimum `sensing_confidence` fraction (0.0-1.0) for a "
+                            "frame to be scored at all; below it the frame is "
+                            "treated as unscorable (UNKNOWN) rather than calm, so a "
+                            "face-detector dropout surfaces as sensor-blind instead "
+                            "of silence. Default 0.0 disables the check, preserving "
+                            "the previous behaviour.")
     watch.add_argument("--score-field", default="global_max_pressure")
     watch.add_argument("--sns", action="store_true",
                        help="also publish alerts to AWS SNS (requires --sns-topic-arn)")
