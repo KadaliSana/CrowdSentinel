@@ -5,7 +5,8 @@ look like the file-replay `FrameSource`s in `sfcpi.sources` so the rest of the p
 consumes both identically.
 
 ```
-signaling.py  KvsSignalingClient + the SDP/ICE message envelope (boto3-based, no aiortc)
+signaling.py  KvsSignalingClient + the SDP/ICE message envelope + sign_wss_url (SigV4 query
+              signing, via botocore.auth/botocore.awsrequest -- no aiortc, no boto3 import)
 bridge.py     FrameBridge -- bounded, drop-oldest async(producer) -> sync(consumer) handoff
 source.py     WebRTCSource -- FrameSource-shaped: .fps, __iter__, .connect()
 ```
@@ -37,21 +38,54 @@ What has been checked, and how:
   and a live-but-silent signalling peer (one that accepts the connection but never answers)
   -- both correctly raise `TimeoutError` naming the phase, neither hangs.
 
-**Known gap: the WSS URL is used unsigned.** `KvsSignalingClient.endpoints()` returns the
-raw endpoint AWS reports; real KVS requires the WebSocket handshake itself to carry SigV4
-*query-string* authentication (a WebSocket handshake can't carry a normal `Authorization`
-header, so AWS's viewer/master SDKs sign the URL's query string the way a presigned S3 URL
-is signed). `WebRTCSource.connect()` does **not** do this signing -- it was kept out of this
-task's scope to match `signaling.py`'s own scope (task 2) and to keep the two required tests
-network-free and deterministic (adding a `describe()`/credentials round trip ahead of the
-socket open would defeat the fake signalling client the tests use). **Practically, this
-means `connect()` will fail authentication against a real AWS channel today.** Signing the
-WSS URL (SigV4 query auth, service `kinesisvideo`, using the credentials already on the
-injected `kinesisvideo` boto3 client) is the next piece of work before a live smoke test can
-even reach the signalling handshake.
+**SigV4 WSS signing is now implemented** (`sign_wss_url` in `signaling.py`, wired into
+`WebRTCSource.connect()`). `KvsSignalingClient.endpoints()` used to return the raw AWS
+endpoint and `connect()` used it as-is; real KVS requires the WebSocket handshake itself to
+carry SigV4 *query-string* authentication (a WebSocket handshake can't carry a normal
+`Authorization` header, so AWS's viewer/master SDKs sign the URL's query string the way a
+presigned S3 URL is signed). `connect()` now signs the WSS URL before opening it, whenever
+signing is actually possible and needed:
 
-Do the live smoke test (once the signing gap above is closed) with the board actually
-streaming to the channel before trusting this path in anger.
+- `KvsSignalingClient` caches the channel's `ChannelARN` (as `.channel_arn`) the moment
+  `describe()` runs -- which `endpoints()` already does internally -- so signing costs no
+  extra network round trip over what `connect()` was already doing.
+- `connect()` now takes an optional `credentials=` argument (a botocore-style credentials
+  object: `.access_key`, `.secret_key`, optional `.token`), **injected**, never fetched
+  inside this package by default. If omitted, `connect()` falls back lazily to
+  `boto3.Session().get_credentials()` -- but only when there is a `channel_arn` to sign
+  against in the first place, so the network-free tests (whose fake signalling objects have
+  no `channel_arn`) neither pay for nor depend on that lookup: signing is skipped and the
+  raw URL is used, exactly as before this feature existed. Against a real
+  `KvsSignalingClient` where `channel_arn` is set but no credentials can be found anywhere,
+  `connect()` raises `RuntimeError` before opening any socket, rather than silently
+  attempting an unsigned (and certain-to-fail) connection.
+- Signing itself is delegated to `botocore.auth.SigV4QueryAuth` against a
+  `botocore.awsrequest.AWSRequest` (service `kinesisvideo`) -- not hand-rolled HMAC --
+  because canonicalisation and percent-encoding are easy to get subtly wrong by hand. The
+  signature covers the request's host and path, not its scheme: `sign_wss_url` signs the
+  `https://` form of the endpoint and returns the result with the `wss://` scheme restored.
+
+**Verified by `tests/sfcpi/test_webrtc_signing.py` (network-free, no real credentials --
+uses `botocore.credentials.Credentials("AKIDEXAMPLE", ...)` and a frozen timestamp):** the
+signed URL keeps the `wss://` scheme, host and path; all six presign params
+(`X-Amz-Algorithm`, `X-Amz-Credential`, `X-Amz-Date`, `X-Amz-Expires`, `X-Amz-SignedHeaders`,
+`X-Amz-Signature`) are present; `X-Amz-ChannelARN` is present and correctly percent-encoded;
+`X-Amz-ClientId` appears iff a `client_id` is given; signing twice with the same frozen
+timestamp is byte-identical (determinism); **changing the channel ARN with everything else
+fixed changes `X-Amz-Signature`** (proof the signature actually covers the request, not a
+constant); a session token on the credentials appears as `X-Amz-Security-Token`; and an
+empty `wss_endpoint` or `channel_arn` raises `ValueError` naming the missing field. Also
+manually verified (not committed, no assertions, just a wiring smoke check) that
+`WebRTCSource.connect()` actually passes the *signed* URL to `websockets.connect(...)`
+against a fake `kinesisvideo` client, and that omitting credentials against a real
+`channel_arn` with no AWS credentials configured anywhere raises the `RuntimeError` above
+rather than connecting unsigned.
+
+**Still NOT verified: nothing has been tested against a real AWS KVS channel.** Whether a
+real KVS signalling service actually accepts a `sign_wss_url(...)`-produced URL --
+correct region, correct scope, correct treatment of `Role: VIEWER` vs `MASTER` in KVS's
+own validation, TURN-credential-adjacent edge cases -- is unverified. Do the live smoke
+test with the board actually streaming to the channel before trusting this path in anger.
 
 ## Required IAM permissions
 
@@ -99,6 +133,10 @@ signaling = KvsSignalingClient(
 )
 
 source = WebRTCSource(signaling, warmup_frames=10, connect_timeout_s=15.0)
+# credentials= is optional -- omitted here, connect() falls back lazily to
+# boto3.Session().get_credentials() itself (env vars, shared config, instance/role
+# profile, ...). Pass it explicitly for testability or if the WebRTCSource's caller
+# and the kinesisvideo client above should not share the ambient credential chain.
 source.connect()  # blocks until the remote video track is flowing, or raises
 
 try:
@@ -119,8 +157,12 @@ runs with zero frames:
 - `RuntimeError` (mentions `"WSS"`) -- the channel has no WSS endpoint; checked before any
   thread or socket is created, so a bad channel name or missing IAM permission fails
   immediately rather than hanging for `connect_timeout_s`.
+- `RuntimeError` (mentions `"credentials"`) -- the channel needs a SigV4-signed WSS
+  connection (its `ChannelARN` is known) but no AWS credentials were found anywhere, neither
+  passed as `credentials=` nor discoverable by `boto3.Session().get_credentials()`; also
+  checked before any thread or socket is created.
 - `TimeoutError`, message names the phase -- `"signalling connect"` (couldn't open/complete
-  the WebSocket handshake in time: DNS, network path, or the signing gap above) vs.
+  the WebSocket handshake in time: DNS, network path, or bad/expired signing) vs.
   `"ICE/media negotiation"` (WebSocket connected, SDP exchanged, but no video track arrived
   in time: ICE/NAT/TURN problem, or the far end never started sending).
 - Any other exception the negotiation or media loop raises reaches the caller the same way,
@@ -129,7 +171,8 @@ runs with zero frames:
 
 ## Deferred (explicitly out of scope for this cycle)
 
-- SigV4-signing the WSS URL (see "Known gap" above) -- blocks the live smoke test.
+- The live smoke test itself (SigV4 signing is now implemented -- see above -- but nothing
+  has actually connected to a real AWS KVS channel with it yet).
 - Reconnection/backoff on a dropped connection.
 - TURN credential refresh (KVS ICE server credentials expire; nothing here renews them).
 - Outbound media / audio -- this is a receive-only (`recvonly`) viewer.

@@ -25,7 +25,7 @@ import numpy as np
 from sfcpi.sources import Frame
 
 from .bridge import FrameBridge
-from .signaling import decode_message, encode_sdp_offer
+from .signaling import decode_message, encode_sdp_offer, sign_wss_url
 
 
 class WebRTCSource:
@@ -184,6 +184,7 @@ class WebRTCSource:
         timeout_s: Optional[float] = None,
         client_id: Optional[str] = None,
         ice_servers: Optional[list] = None,
+        credentials: Optional[Any] = None,
     ) -> None:
         """Open the KVS WebRTC signalling connection and start feeding frames.
 
@@ -194,6 +195,21 @@ class WebRTCSource:
         Blocks the calling thread until the remote video track starts
         flowing, or raises TimeoutError naming whichever phase -- "signalling
         connect" or "ICE/media negotiation" -- did not complete in time.
+
+        The WSS URL is SigV4-signed before use (real KVS requires this; the
+        handshake can't carry a normal Authorization header). `credentials`
+        is a botocore-style credentials object and is INJECTED -- if not
+        given, it is looked up lazily via `boto3.Session().get_credentials()`
+        (imported here, not at module scope) but ONLY when signing is
+        actually needed: `self.signaling.channel_arn` is `None` for any
+        signalling object that hasn't done a real `describe()` (in
+        particular the fakes the network-free tests use), and in that case
+        signing is skipped entirely and the raw URL is used as-is, exactly
+        as before this method could sign anything -- so those tests neither
+        pay for nor depend on a `boto3` credential lookup. Against a real
+        `KvsSignalingClient`, `channel_arn` is already cached from the
+        `describe()` call `endpoints()` just made above, so this costs no
+        extra network round trip.
 
         aiortc and websockets are imported here, not at module scope, so
         importing this module (and running the non-connect tests) never
@@ -211,10 +227,33 @@ class WebRTCSource:
                 f"kinesisvideo:GetSignalingChannelEndpoint"
             )
 
+        client_id = client_id or f"sfcpi-viewer-{uuid.uuid4().hex[:12]}"
+
+        channel_arn = getattr(self.signaling, "channel_arn", None)
+        if channel_arn:
+            if credentials is None:
+                import boto3  # noqa: F401  (lazy; connect-path only)
+
+                credentials = boto3.Session().get_credentials()
+            if credentials is None:
+                raise RuntimeError(
+                    f"KVS signalling channel {self.signaling.channel_name!r} "
+                    f"needs a SigV4-signed WSS connection but no AWS "
+                    f"credentials were found; pass credentials= or configure "
+                    f"the environment (env vars, shared config, or an "
+                    f"instance/role profile)"
+                )
+            wss_url = sign_wss_url(
+                wss_url,
+                channel_arn,
+                self.signaling.region,
+                credentials,
+                client_id=client_id,
+            )
+
         import aiortc  # noqa: F401  (lazy; connect-path only)
         import websockets  # noqa: F401  (lazy; connect-path only)
 
-        client_id = client_id or f"sfcpi-viewer-{uuid.uuid4().hex[:12]}"
         self._phase = "signalling connect"
         self._connect_error = None
         ready = threading.Event()
