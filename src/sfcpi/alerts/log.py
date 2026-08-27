@@ -16,9 +16,15 @@ class LogSink:
 
     def publish(self, event: RiskEvent) -> None:
         pressure = "n/a" if event.pressure is None else f"{event.pressure:.4f}"
+        # Coverage is mandatory on every event, not optional detail: the
+        # crowd sensor is a face detector whose count is biased downward
+        # exactly when crowds densify, so an alert that cannot say how much
+        # of the frame was actually sensed is not actionable.
+        coverage = "n/a" if event.coverage is None else f"{event.coverage * 100:.1f}%"
         self._stream.write(
             f"[ALERT {event.level.value.upper()}] t={event.timestamp:.2f} "
-            f"pressure={pressure} reason={event.reason} :: {event.message}\n"
+            f"pressure={pressure} coverage={coverage} reason={event.reason} "
+            f":: {event.message}\n"
         )
         self._stream.flush()
         self.count += 1

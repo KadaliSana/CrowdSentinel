@@ -24,3 +24,15 @@ def test_recording_sink_collects_events():
     sink = RecordingSink()
     sink.publish(_ev())
     assert len(sink.events) == 1 and sink.events[0].level is RiskLevel.HIGH
+
+def test_log_line_renders_coverage_as_percentage():
+    buf = io.StringIO()
+    LogSink(stream=buf).publish(_ev())  # _ev() sets coverage=0.9
+    assert "coverage=90.0%" in buf.getvalue()
+
+def test_log_line_renders_missing_coverage_as_na():
+    buf = io.StringIO()
+    ev = RiskEvent(timestamp=1.5, level=RiskLevel.HIGH, previous_level=RiskLevel.NORMAL,
+                   pressure=0.025, coverage=None, reason="escalation", message="m")
+    LogSink(stream=buf).publish(ev)
+    assert "coverage=n/a" in buf.getvalue()

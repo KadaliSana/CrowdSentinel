@@ -148,31 +148,71 @@ def _cmd_watch(args: argparse.Namespace) -> int:
         high_rise=args.threshold_high, high_fall=args.threshold_high * 0.8
     )
 
-    # There is a single --min-dwell knob on this CLI (not one per tier), so it
-    # is reused for blind_alert_s too: a NaN pressure (sensor gone blind) must
-    # dwell just like any other candidate level before being adopted.
     machine = RiskStateMachine(
         thresholds,
         min_dwell_s=args.min_dwell,
         min_realert_s=args.min_realert,
-        blind_alert_s=args.min_dwell,
+        blind_alert_s=args.blind_alert,
     )
 
-    with open(args.metrics, encoding="utf-8") as fh:
-        for line in fh:
-            line = line.strip()
-            if not line:
-                continue
-            row = json.loads(line)
-            value = row.get(args.score_field)
-            pressure = float("nan") if value is None else float(value)
-            ts = row.get("timestamp")
-            timestamp = 0.0 if ts is None else float(ts)
+    try:
+        with open(args.metrics, encoding="utf-8") as fh:
+            raw_lines = fh.readlines()
+    except OSError as exc:
+        # Mirrors _cmd_run: a missing or unopenable metrics file must name
+        # the path and exit non-zero, not raise a bare traceback.
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
 
-            event = machine.update(timestamp, pressure)
-            if event is not None:
-                for sink in sinks:
-                    sink.publish(event)
+    rows = []
+    for lineno, line in enumerate(raw_lines, start=1):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rows.append(json.loads(line))
+        except json.JSONDecodeError as exc:
+            print(
+                f"error: {args.metrics}: invalid JSON on line {lineno}: {exc}",
+                file=sys.stderr,
+            )
+            return 2
+
+    # A missing `timestamp` must never become 0.0 -- every row would then
+    # collide at t=0, dwell would never complete, and a CRITICAL-pressure
+    # file would replay as a silent, alert-free "calm crowd" (exit 0, no
+    # output). Synthesise from --fps and row index instead, but only ever
+    # loudly: this is a per-row time base for a safety alert, not a cosmetic
+    # default.
+    raw_timestamps = [row.get("timestamp") for row in rows]
+    n_missing = sum(1 for ts in raw_timestamps if ts is None)
+    synth_fps = None
+    if n_missing:
+        synth_fps = args.fps
+        if synth_fps is None:
+            synth_fps = _fps_from_timestamps(raw_timestamps)
+        if synth_fps is None:
+            synth_fps = DEFAULT_EVAL_FPS
+        print(
+            f"warning: {n_missing} row(s) in {args.metrics} have no timestamp; "
+            f"synthesising timestamps from --fps {synth_fps} and row index -- "
+            f"alert timing will be WRONG if this does not match the true frame "
+            f"rate. Pass --fps to set it explicitly.",
+            file=sys.stderr,
+        )
+
+    for idx, row in enumerate(rows):
+        value = row.get(args.score_field)
+        pressure = float("nan") if value is None else float(value)
+        ts = row.get("timestamp")
+        timestamp = (idx / synth_fps) if ts is None else float(ts)
+        coverage_raw = row.get("sensing_confidence")
+        coverage = None if coverage_raw is None else float(coverage_raw)
+
+        event = machine.update(timestamp, pressure, coverage=coverage)
+        if event is not None:
+            for sink in sinks:
+                sink.publish(event)
 
     return 0
 
@@ -254,11 +294,22 @@ def build_parser() -> argparse.ArgumentParser:
                        help="high-tier rise threshold in s^-2 (fall is scaled to keep "
                             "the default 0.8 rise/fall ratio)")
     watch.add_argument("--min-dwell", type=float, default=2.0,
-                       help="seconds a candidate level (including sensor-blind) must "
-                            "persist before it is adopted")
+                       help="seconds a candidate level must persist before it is "
+                            "adopted (sensor-blind uses --blind-alert instead)")
+    watch.add_argument("--blind-alert", type=float, default=30.0,
+                       help="seconds a sensor-blind (NaN pressure) candidate must "
+                            "persist before it is adopted; kept separate from "
+                            "--min-dwell because a false blind-alert pages someone")
     watch.add_argument("--min-realert", type=float, default=60.0,
                        help="seconds to suppress a repeat de-escalation alert for the "
-                            "same level; escalations always bypass this")
+                            "same level; only an escalation strictly above the last "
+                            "alerted level bypasses this")
+    watch.add_argument("--fps", type=float, default=None,
+                       help="frame rate used to synthesise a timestamp (index / fps) "
+                            "for rows with no `timestamp` field; default is derived "
+                            f"from the metrics file's other timestamps, falling back "
+                            f"to {DEFAULT_EVAL_FPS}. A missing timestamp always prints "
+                            "a warning; it is never silently treated as t=0.")
     watch.add_argument("--score-field", default="global_max_pressure")
     watch.add_argument("--sns", action="store_true",
                        help="also publish alerts to AWS SNS (requires --sns-topic-arn)")

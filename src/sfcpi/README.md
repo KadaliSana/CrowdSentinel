@@ -48,15 +48,35 @@ semantics, not two.
 
 ### `watch` — replay metrics through the risk state machine
 
-    python3 -m sfcpi.cli watch metrics.jsonl --threshold-high 0.02 --min-dwell 2.0
+    python3 -m sfcpi.cli watch metrics.jsonl --threshold-high 0.02 --min-dwell 2.0 --blind-alert 30.0
 
 Reads a `sfcpi run` JSONL metrics file line by line and feeds `--score-field`
 (default `global_max_pressure`) through the hysteresis + dwell + re-alert
 state machine (`sfcpi.risk`), printing `[ALERT ...]` lines to stderr via
-`LogSink` as levels change. A `null` score is read as NaN, never `0.0` — a
+`LogSink` as levels change. Each `LogSink` line also names `coverage` (the
+row's `sensing_confidence`, as a percentage, `n/a` when absent) — the crowd
+sensor is a face detector whose count is biased downward exactly when crowds
+densify, so an alert that cannot say how much of the frame was actually
+sensed is not actionable. A `null` score is read as NaN, never `0.0` — a
 blind sensor must reach the state machine as UNKNOWN (raising a
 `sensor-blind` alert after it dwells), not as a falsely-calm `NORMAL`
 reading.
+
+`--min-dwell` (default 2.0s) gates ordinary level changes; sensor-blind uses
+its own `--blind-alert` (default 30.0s, matching the library default) so a
+brief camera glitch does not page someone at the same eagerness as a real
+crowd-pressure escalation.
+
+A row missing the `timestamp` key is never silently treated as `t=0.0`
+(every row would then collide at the same instant, dwell would never
+complete, and a CRITICAL-pressure file could replay as a silent, alert-free
+"calm crowd"). Instead `watch` prints a loud stderr warning and synthesises
+`timestamp = index / fps`, where `fps` is `--fps` if given, else derived from
+any other timestamps present in the file, else the eval default. Pass `--fps`
+to set it explicitly whenever the true frame rate is known.
+
+A missing or unparseable `metrics` file prints `error: ...` naming the path
+and exits non-zero, the same as `run`.
 
 Pass `--sns --sns-topic-arn arn:aws:sns:...` to also publish to AWS SNS.
 **`--dry-run` defaults to `true` whenever `--sns` is given** — alerts are
