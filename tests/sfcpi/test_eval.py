@@ -1,5 +1,8 @@
+import json
+
 import numpy as np
 import pytest
+from sfcpi.cli import main
 from sfcpi.eval import (
     detection_latency, evaluate, false_alarms_per_hour, load_labels, roc_auc,
 )
@@ -46,3 +49,48 @@ def test_nan_scores_are_treated_as_no_alarm():
     scores = np.array([np.nan, np.nan, 0.9, 0.9])
     labels = np.array([0, 0, 1, 1])
     assert detection_latency(scores, labels, 0.5) == 0
+
+def test_false_alarms_per_hour_nan_when_no_negative_frames():
+    scores = np.array([0.9, 0.9, 0.9, 0.9])
+    labels = np.ones(4)
+    assert np.isnan(false_alarms_per_hour(scores, labels, 0.5, fps=2.0))
+
+
+def _write_metrics_and_labels(tmp_path, score_values, label_values):
+    metrics_path = tmp_path / "metrics.jsonl"
+    with metrics_path.open("w", encoding="utf-8") as fh:
+        for i, value in enumerate(score_values):
+            fh.write(json.dumps({"index": i, "global_max_pressure": value}) + "\n")
+    labels_path = tmp_path / "labels.csv"
+    labels_path.write_text(
+        "label\n" + "\n".join(str(v) for v in label_values) + "\n"
+    )
+    return str(metrics_path), str(labels_path)
+
+
+def test_cli_eval_serialises_nan_auc_as_null_strict_json(tmp_path, capsys):
+    # All-zero labels -> roc_auc returns NaN (one class absent). The printed
+    # output must be strict JSON with `null`, never a bare `NaN` literal.
+    metrics_path, labels_path = _write_metrics_and_labels(
+        tmp_path, [0.1, 0.2, None, 0.9], [0, 0, 0, 0]
+    )
+    rc = main(["eval", metrics_path, "--labels", labels_path, "--fps", "10"])
+    assert rc == 0
+    raw = capsys.readouterr().out
+    assert "NaN" not in raw
+    parsed = json.loads(raw)
+    assert parsed["auc"] is None
+
+
+def test_cli_eval_serialises_nan_false_alarms_as_null_strict_json(tmp_path, capsys):
+    # All-positive labels -> false_alarms_per_hour has zero negative frames
+    # and returns NaN. Same strict-JSON requirement as the auc case.
+    metrics_path, labels_path = _write_metrics_and_labels(
+        tmp_path, [0.1, 0.2, 0.8, 0.9], [1, 1, 1, 1]
+    )
+    rc = main(["eval", metrics_path, "--labels", labels_path, "--fps", "10"])
+    assert rc == 0
+    raw = capsys.readouterr().out
+    assert "NaN" not in raw
+    parsed = json.loads(raw)
+    assert parsed["false_alarms_per_hour"] is None

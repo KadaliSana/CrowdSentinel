@@ -51,6 +51,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
 
 def _cmd_eval(args: argparse.Namespace) -> int:
     import json
+    import math
     import numpy as np
     from .eval import evaluate, load_labels
 
@@ -63,7 +64,13 @@ def _cmd_eval(args: argparse.Namespace) -> int:
     labels = load_labels(args.labels)
     n = min(len(scores), len(labels))
     result = evaluate(np.array(scores[:n]), labels[:n], args.threshold, args.fps)
-    print(json.dumps(result, indent=2))
+
+    def _jsonable(value):
+        if isinstance(value, float) and not math.isfinite(value):
+            return None
+        return value
+
+    print(json.dumps({k: _jsonable(v) for k, v in result.items()}, indent=2))
     return 0
 
 
