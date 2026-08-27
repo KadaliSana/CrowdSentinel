@@ -112,7 +112,20 @@ def test_client_id_absent_when_not_given():
     assert "X-Amz-ClientId" not in params
 
 
+FROZEN_AMZ_DATE = FROZEN_TIMESTAMP.strftime("%Y%m%dT%H%M%SZ")  # 20260101T120000Z
+
+
 def test_signing_is_deterministic_for_a_frozen_timestamp():
+    """Two identical calls must sign identically -- AND the signature must
+    actually be the frozen one.
+
+    SigV4 dates are second-granular, so equality alone would still pass if
+    the `frozen_clock` fixture silently stopped working (a botocore rename
+    of get_current_datetime, say) whenever both calls landed in the same
+    wall-clock second -- which, for two calls in a row, is nearly always.
+    Asserting the literal frozen value is what makes the fixture's failure
+    visible instead of invisible.
+    """
     first = sign_wss_url(
         WSS_ENDPOINT,
         CHANNEL_ARN,
@@ -128,6 +141,7 @@ def test_signing_is_deterministic_for_a_frozen_timestamp():
         client_id="viewer-abc",
     )
     assert first == second
+    assert _query(first)["X-Amz-Date"] == "20260101T120000Z" == FROZEN_AMZ_DATE
 
 
 def test_changing_channel_arn_changes_the_signature():
