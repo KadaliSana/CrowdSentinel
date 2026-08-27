@@ -2,6 +2,11 @@
 
 Computes crowd pressure `P = rho * Var(v)` from **uncalibrated** video.
 
+`Var(v)` is the variance of the velocity VECTORS (`Var(vx) + Var(vy)`), not of
+speed magnitudes — per Johansson et al. (2008), conclusions: "the density times
+the variance of velocities". Magnitude variance is 0 for perfect counterflow,
+which would read "safe" in exactly the regime where pressure peaks.
+
 `P` has units of `s^-2` and carries no length dimension, so the unknown
 metres-per-pixel scale cancels exactly. Pressure computed in pixel space equals
 pressure in real units, given only the frame rate — see

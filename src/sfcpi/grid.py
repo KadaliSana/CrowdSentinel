@@ -9,7 +9,7 @@ from typing import Iterator
 
 import numpy as np
 
-from .metrics import crowd_pressure, density_px, mean_speed, speed_variance
+from .metrics import crowd_pressure, density_px, mean_speed, velocity_variance
 
 
 class CellGrid:
@@ -45,12 +45,12 @@ class CellGrid:
 
         out = {
             key: np.full(expected, np.nan, dtype=float)
-            for key in ("pressure", "mean_speed", "speed_variance", "density")
+            for key in ("pressure", "mean_speed", "velocity_variance", "density")
         }
         for row, col, ys, xs in self.iter_cells():
             cell = flow[ys, xs]
-            var = speed_variance(cell)
-            out["speed_variance"][row, col] = var
+            var = velocity_variance(cell)
+            out["velocity_variance"][row, col] = var
             out["mean_speed"][row, col] = mean_speed(cell)
             out["density"][row, col] = density_px(counts[row, col], self.cell_area_px)
             out["pressure"][row, col] = crowd_pressure(

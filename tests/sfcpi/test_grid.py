@@ -23,9 +23,9 @@ def test_aggregate_shapes_and_uniform_motion():
     flow = np.full((4, 4, 2), 2.0)
     counts = np.full((2, 2), 5.0)
     out = g.aggregate(flow, counts, fps=10.0)
-    for key in ("pressure", "mean_speed", "speed_variance", "density"):
+    for key in ("pressure", "mean_speed", "velocity_variance", "density"):
         assert out[key].shape == (2, 2)
-    assert out["speed_variance"] == pytest.approx(0.0)
+    assert out["velocity_variance"] == pytest.approx(0.0)
     assert out["pressure"] == pytest.approx(0.0)
     assert out["mean_speed"] == pytest.approx(np.sqrt(8.0))
 
@@ -36,8 +36,8 @@ def test_aggregate_isolates_cells():
     flow[0, 0] = (6.0, 0.0)          # single moving pixel in cell (0,0)
     counts = np.ones((1, 2))
     out = g.aggregate(flow, counts, fps=10.0)
-    assert out["speed_variance"][0, 0] > 0
-    assert out["speed_variance"][0, 1] == pytest.approx(0.0)
+    assert out["velocity_variance"][0, 0] > 0
+    assert out["velocity_variance"][0, 1] == pytest.approx(0.0)
 
 def test_counts_shape_must_match_grid():
     g = CellGrid(frame_width=4, frame_height=4, cell_size=2)
@@ -70,6 +70,6 @@ def test_motionless_cell_has_zero_variance_not_nan():
     flow = np.zeros((4, 4, 2))
     counts = np.ones((2, 2))
     out = g.aggregate(flow, counts, fps=10.0)
-    assert (out["speed_variance"] == 0.0).all()
+    assert (out["velocity_variance"] == 0.0).all()
     assert (out["pressure"] == 0.0).all()
     assert not np.isnan(out["pressure"]).any()
