@@ -8,18 +8,35 @@ consumes both identically.
 signaling.py  KvsSignalingClient + the SDP/ICE message envelope + sign_wss_url (SigV4 query
               signing, via botocore.auth/botocore.awsrequest -- no aiortc, no boto3 import)
 bridge.py     FrameBridge -- bounded, drop-oldest async(producer) -> sync(consumer) handoff
+metadata.py   parse_detection_message -- the board's per-inference JSON off the data channel
 source.py     WebRTCSource -- FrameSource-shaped: .fps, __iter__, .connect()
 ```
 
-## Status: plumbing verified, live path NOT verified against a real channel
+`FrameBridge` is **drop-oldest**: under a consumer slower than the stream it discards frames
+rather than growing a queue. Consecutive frames handed to the pipeline are therefore often many
+multiples of `1/fps` apart, which is why `Pipeline.run` derives its rate from
+`frame.timestamp` deltas and not from `.fps` -- see CLAUDE.md, "Warning: pressure numbers from
+before the dt fix are not comparable".
 
-Everything in this package has an automated test, and those tests are real (they exercise
-actual code paths, not mocks-all-the-way-down) -- but **no test in this repo, and no run by
-the author of this README, has ever moved a real frame from a real AWS KVS channel through
-`WebRTCSource`.** A green `pytest` run here means *the wiring is correct*: precondition
+## Status: verified live end to end against real AWS KVS -- RTP and data channel both arrive
+
+**Live runs against the real `camstream` channel, 2026-08-28.** SigV4 signing, the signalling
+handshake, SDP offer/answer, ICE, DTLS and now RTP all complete against real AWS and a real
+board acting as master (`a=setup:active`, `a=sendonly`, `myKvsVideoStream`, H.264 PT 101).
+`WebRTCSource` moves real decoded frames into the pipeline, and the board's per-inference JSON
+arrives on the same peer connection's data channel. `src/dashboard/server.py` consumes this
+package directly and runs the SF-CPI pipeline on those frames in-process.
+
+Getting there took three protocol defects this package's tests could not have found on their
+own -- see "Three defects found live" below. The last of them is the one that used to make this
+section read "the master negotiates fully and then sends zero media packets": it was **not**
+board-side after all, it was the viewer's own SDP advertising three DTLS fingerprints.
+
+A green `pytest` run here means *the wiring is correct*: precondition
 checks fire before any I/O, the async/thread/queue plumbing doesn't deadlock or leak, and
 errors reach the consumer instead of vanishing into a silent (and therefore falsely
-reassuring) empty stream. It does not mean live ingest works end to end.
+reassuring) empty stream. It is still not a substitute for a live run -- all three defects
+below were invisible to it.
 
 What has been checked, and how:
 
@@ -93,11 +110,77 @@ against a fake `kinesisvideo` client, and that omitting credentials against a re
 `channel_arn` with no AWS credentials configured anywhere raises the `RuntimeError` above
 rather than connecting unsigned.
 
-**Still NOT verified: nothing has been tested against a real AWS KVS channel.** Whether a
-real KVS signalling service actually accepts a `sign_wss_url(...)`-produced URL --
-correct region, correct scope, correct treatment of `Role: VIEWER` vs `MASTER` in KVS's
-own validation, TURN-credential-adjacent edge cases -- is unverified. Do the live smoke
-test with the board actually streaming to the channel before trusting this path in anger.
+**Now verified live:** real KVS accepts a `sign_wss_url(...)`-produced URL -- the WebSocket
+handshake succeeds against `wss://v-*.kinesisvideo.ap-south-1.amazonaws.com` with
+`Role: VIEWER`. TURN credentials from `GetIceServerConfig` (fields `Uris`/`Username`/
+`Password`/`Ttl`) drive ICE to `completed`, and DTLS negotiates SRTP_AES128_CM_SHA1_80.
+
+## Three defects found live (all fixed, all with regression tests)
+
+None was reachable from a local fake; all three required real KVS traffic and the real board.
+
+1. **KVS sends empty-string WebSocket frames as keepalives.** The FIRST frame after the
+   SDP_OFFER is zero-length, and more arrive through a session. `decode_message` correctly
+   calls an empty payload malformed, so negotiation died on message #1 with
+   `ValueError: malformed signalling message payload`. Both recv loops now skip keepalives
+   via `signaling.is_keepalive` -- deliberately narrow (empty/whitespace only), so a
+   non-empty corrupt frame still raises rather than being silently dropped.
+   (`tests/sfcpi/test_webrtc_keepalive.py`)
+
+2. **The viewer must TRICKLE its own ICE candidates; the master ignores the ones in the
+   offer SDP.** With candidates carried only in the SDP, our side reached ICE `completed`
+   but the master never formed a valid pair, never sent the DTLS ClientHello (it answers
+   `a=setup:active`, so it is the DTLS client), and tore the session down after ~34s with
+   `connectionState` stuck at `connecting`. `_negotiate_media` now sends one `ICE_CANDIDATE`
+   message per local candidate right after the offer, attributed to the correct m= section.
+   AWS's own JS sample says to leave Trickle ICE enabled; this is why.
+   (`tests/sfcpi/test_webrtc_trickle.py`)
+
+3. **aiortc's three DTLS fingerprints break the KVS C SDK master -- this is what "connected but
+   no RTP" actually was.** aiortc puts three `a=fingerprint:` lines in its offer: sha-256 (95
+   chars), sha-384 (143) and sha-512 (191). The KVS C SDK master on the AmebaPro2 sizes its
+   fingerprint buffer for sha-256 and rejects the sha-512 line, then fails certificate
+   verification and destroys the session. Board log:
+
+   ```
+   [ERROR] DTLS_VerifyRemoteCertificateFingerprint: ... CERTIFICATE_FINGERPRINT_LENGTH < fingerprintMaxLen(191)
+   [ERROR] OnDtlsHandshakeComplete: Fail to DTLS_VerifyRemoteCertificateFingerprint with return 255
+   ```
+
+   The failure is **invisible from the viewer's side**: our own DTLS handshake completes first,
+   so `connectionState` goes to `connected` and stays there -- and then no RTP and no data
+   channel ever arrive. That is why this looked for so long like a board-side "master sends zero
+   media packets" bug. Browsers send a single sha-256 line, which is why the AWS console viewer
+   worked against the same board the entire time.
+
+   Fix: `keep_single_fingerprint()` in `signaling.py`, applied to `pc.localDescription.sdp`
+   before the offer is sent (`source.py`, `_negotiate_media`). It keeps the first sha-256 line
+   of each m= section and drops the rest -- safe, because they are alternative digests of the
+   SAME certificate and RFC 8122 requires the peer to verify only one. It raises `ValueError`
+   if there is no sha-256 line at all, rather than sending an unverifiable offer.
+   (`tests/sfcpi/test_webrtc_fingerprint.py`)
+
+## Operational gotcha: the board allows only two viewers
+
+`AWS_MAX_VIEWER_NUM` is `2` in `examples/demo_config/demo_config.h`, and a stale session is only
+reclaimed on a 30 s inactivity timer (`PEER_CONNECTION_INACTIVE_CONNECTION_TIMEOUT_MS = 30000`,
+`examples/peer_connection/peer_connection_data_types.h`). With the dashboard and the AWS console
+viewer both connected, a third viewer -- e.g. `sfcpi live` -- gets no answer and dies with
+`TimeoutError: ... ICE/media negotiation`.
+
+**That is contention, not the fingerprint bug.** They fail at different phases: contention fails
+during negotiation (no answer / no track), the fingerprint bug failed *later*, after the viewer
+reported `connected`, at DTLS verification on the board. Close the other viewer, or wait 30 s for
+the board to reclaim its slot.
+
+## Known wart: `connect()` returns before media flows
+
+`connect()` returns when the remote track OBJECT exists -- aiortc fires `track` during
+`setRemoteDescription`, before ICE nomination and before DTLS. It is therefore NOT proof
+that media is flowing, despite what this README used to say. The real media confirmation is
+the first frame out of `FrameBridge`; if the far end never sends RTP, the caller sees
+`TimeoutError: no frame within 10.0s` from `__iter__`, not from `connect()`. Waiting on
+`connectionState == "connected"` inside `connect()` would tighten this, and is not done.
 
 ## Required IAM permissions
 
@@ -183,10 +266,15 @@ runs with zero frames:
 
 ## Deferred (explicitly out of scope for this cycle)
 
-- The live smoke test itself (SigV4 signing is now implemented -- see above -- but nothing
-  has actually connected to a real AWS KVS channel with it yet).
 - Reconnection/backoff on a dropped connection.
 - TURN credential refresh (KVS ICE server credentials expire; nothing here renews them).
 - Outbound media / audio -- this is a receive-only (`recvonly`) viewer.
-- Wiring `WebRTCSource` into `src/dashboard/server.py` in place of the current RTSP source --
-  a follow-up once the live smoke test passes, not before.
+
+Done since this list was written: end-to-end frame delivery (defect 3 above) and wiring
+`WebRTCSource` into `src/dashboard/server.py`, which now runs the SF-CPI pipeline on the frames
+this package produces. The dashboard is WebRTC-only; nothing in this repo ingests RTSP.
+
+Not a defect of this package, but it shapes what the frames are worth: the board burns its OSD
+detection rectangles into the same H.264 stream, so those boxes are image content that moves,
+and host-side optical flow reads them as motion. See CLAUDE.md, "OSD boxes are burned into the
+analytics stream" -- unresolved.

@@ -31,6 +31,10 @@
 #include "demo_config.h"
 #include "app_common.h"
 #include "app_media_source.h"
+#include "app_media_source_port.h"
+#if ENABLE_SCTP_DATA_CHANNEL
+    #include "peer_connection_sctp.h"
+#endif
 #include "logging.h"
 
 AppContext_t appContext;
@@ -43,6 +47,71 @@ static int32_t InitTransceiver( void * pMediaCtx,
                                 Transceiver_t * pTranceiver );
 static int32_t OnMediaSinkHook( void * pCustom,
                                 MediaFrame_t * pFrame );
+#if ENABLE_SCTP_DATA_CHANNEL
+
+/* Push one inference's detection JSON to every viewer that has an open data
+ * channel.
+ *
+ * The NN results are already drawn into the video as OSD rectangles, but a
+ * remote consumer cannot read pixels as numbers; this is the path that gets
+ * the SCRFD boxes off the board. Mirrors OnMediaSinkHook: same per-session
+ * loop, same CONNECTION_READY gate.
+ *
+ * Best effort by design -- a viewer whose channel is closed, or a send that
+ * fails, must never stall the NN callback that calls this, and must never
+ * affect the video path. */
+static int32_t OnMetadataSinkHook( void * pCustom,
+                                   const char * pJson,
+                                   uint32_t length )
+{
+    AppContext_t * pAppContext = ( AppContext_t * ) pCustom;
+    PeerConnectionDataChannel_t * pChannel;
+    PeerConnectionResult_t peerConnectionResult;
+    int i;
+
+    if( ( pAppContext == NULL ) || ( pJson == NULL ) || ( length == 0U ) )
+    {
+        LogError( ( "Invalid input, pCustom: %p, pJson: %p, length: %lu",
+                    pCustom, pJson, ( unsigned long ) length ) );
+        return -1;
+    }
+
+    for( i = 0; i < AWS_MAX_VIEWER_NUM; i++ )
+    {
+        if( pAppContext->appSessions[ i ].peerConnectionSession.state !=
+            PEER_CONNECTION_SESSION_STATE_CONNECTION_READY )
+        {
+            continue;
+        }
+
+        for( pChannel = pAppContext->appSessions[ i ].peerConnectionSession.pDataChannels;
+             pChannel != NULL;
+             pChannel = pChannel->pxNext )
+        {
+            if( ( pChannel->ucChannelActive == 0U ) || ( pChannel->ucChannelOpen == 0U ) )
+            {
+                continue;
+            }
+
+            peerConnectionResult = PeerConnectionSCTP_DataChannelSend( pChannel,
+                                                                      0U, /* string, not binary */
+                                                                      ( uint8_t * ) pJson,
+                                                                      length );
+            if( peerConnectionResult != PEER_CONNECTION_RESULT_OK )
+            {
+                /* Warn, not error: one viewer's channel going away is normal
+                 * and must not look like a fault in the NN or video path. */
+                LogWarn( ( "Fail to send detection metadata on channel %s, result: %d",
+                           pChannel->ucDataChannelName, peerConnectionResult ) );
+            }
+        }
+    }
+
+    return 0;
+}
+
+#endif /* ENABLE_SCTP_DATA_CHANNEL */
+
 static int32_t InitializeAppMediaSource( AppContext_t * pAppContext,
                                          AppMediaSourcesContext_t * pAppMediaSourceContext );
 
@@ -157,6 +226,15 @@ static int32_t InitializeAppMediaSource( AppContext_t * pAppContext,
         ret = AppMediaSource_Init( pAppMediaSourceContext,
                                    OnMediaSinkHook,
                                    pAppContext );
+
+        #if ENABLE_SCTP_DATA_CHANNEL
+        if( ret == 0 )
+        {
+            /* Optional: with no sink registered the NN path is unchanged. */
+            AppMediaSourcePort_RegisterMetadataSink( OnMetadataSinkHook,
+                                                     pAppContext );
+        }
+        #endif /* ENABLE_SCTP_DATA_CHANNEL */
     }
 
     return ret;

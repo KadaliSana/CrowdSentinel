@@ -17,6 +17,7 @@ from __future__ import annotations
 import base64
 import binascii
 import json
+from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
@@ -99,14 +100,184 @@ def _error_code(exc: Exception) -> str | None:
 
 
 def encode_sdp_offer(client_id: str, sdp: str) -> str:
-    """Build the SDP_OFFER message envelope sent over the signalling WebSocket."""
+    """Build the SDP_OFFER envelope a VIEWER sends over the signalling socket.
+
+    NO `recipientClientId`. The AWS JS SDK documents it as "Required for
+    'MASTER' role. Should not be present for 'VIEWER' role" and enforces that
+    in `validateRecipientClientId()`, which THROWS if a viewer supplies one;
+    `examples/viewer.js` calls `sendSdpOffer(localDescription)` with no
+    recipient. We previously sent our OWN client id there, which addresses the
+    offer to ourselves. The viewer identifies itself in the signed WSS URL
+    (`X-Amz-ClientId`), so `client_id` is accepted here only to keep the call
+    signature stable.
+    """
+    del client_id  # identity travels in the signed URL, not the envelope
     payload = json.dumps({"type": "offer", "sdp": sdp}).encode("utf-8")
     message = {
         "action": "SDP_OFFER",
-        "recipientClientId": client_id,
         "messagePayload": base64.b64encode(payload).decode("ascii"),
     }
     return json.dumps(message)
+
+
+def ice_servers_to_rtc(entries: list) -> list[dict]:
+    """Convert a KVS `IceServerList` into aiortc `RTCIceServer(**kwargs)` dicts.
+
+    KVS names the fields `Uris` / `Username` / `Password` / `Ttl`; aiortc
+    wants `urls` / `username` / `credential`. Absent credentials are OMITTED
+    rather than passed as None -- a STUN entry with `username=None,
+    credential=None` is not the same thing to aiortc as a STUN entry with
+    neither.
+
+    `Ttl` is dropped: these credentials expire, and nothing in this package
+    renews them (see the README's Deferred list).
+    """
+    out = []
+    for entry in entries or []:
+        item = {"urls": entry.get("Uris", [])}
+        if entry.get("Username"):
+            item["username"] = entry["Username"]
+        if entry.get("Password"):
+            item["credential"] = entry["Password"]
+        out.append(item)
+    return out
+
+
+def keep_single_fingerprint(sdp: str, algorithm: str = "sha-256") -> str:
+    """Drop every `a=fingerprint:` line except `algorithm`, per m= section.
+
+    aiortc advertises three fingerprints (sha-256, sha-384, sha-512). The KVS
+    C SDK master on the AmebaPro2 sizes its fingerprint buffer for sha-256 and
+    REJECTS the sha-512 line, which is 191 characters:
+
+        DTLS_VerifyRemoteCertificateFingerprint: invalid input, ...
+            CERTIFICATE_FINGERPRINT_LENGTH < fingerprintMaxLen(191)
+        OnDtlsHandshakeComplete: Fail to ... with return 255
+
+    The failure is silent from the viewer's side -- OUR DTLS handshake
+    completes, so the connection reports `connected`, and only the board
+    knows it then failed certificate verification and tore the session down.
+    No media and no data channel ever arrive. A browser sends one sha-256
+    line, which is why AWS's own console viewer worked against the same board.
+
+    Dropping the extra lines is safe: they are alternative digests of the
+    SAME certificate, and RFC 8122 requires only that the peer be able to
+    verify one of them.
+
+    Raises ValueError if no line for `algorithm` exists -- an offer with no
+    fingerprint at all would fail DTLS far more confusingly downstream.
+    """
+    prefix = f"a=fingerprint:{algorithm} "
+    if prefix not in sdp:
+        raise ValueError(
+            f"SDP carries no {algorithm} fingerprint; refusing to send an "
+            f"offer whose DTLS certificate cannot be verified"
+        )
+
+    out = []
+    seen_in_section = False
+    for line in sdp.split("\n"):
+        stripped = line.rstrip("\r")
+        if stripped.startswith("m="):
+            seen_in_section = False
+        if stripped.startswith("a=fingerprint:"):
+            # Keep the first `algorithm` line of each m= section and drop the
+            # rest; a BUNDLE offer with a data channel carries one set per
+            # section, and each section needs its own.
+            if stripped.startswith(prefix) and not seen_in_section:
+                seen_in_section = True
+            else:
+                continue
+        out.append(line)
+    return "\n".join(out)
+
+
+def is_keepalive(raw) -> bool:
+    """True if `raw` is a KVS signalling keepalive rather than a message.
+
+    Observed against a real KVS channel: the signalling service sends
+    zero-length WebSocket frames -- the first one arrives immediately after
+    the SDP_OFFER, before the answer, and more arrive during an idle
+    session. They carry no envelope, so `decode_message` correctly rejects
+    them as malformed; the recv loops must skip them instead of feeding
+    them in.
+
+    Deliberately narrow: ONLY an empty-or-whitespace frame counts. A
+    non-empty frame that merely fails to parse is NOT a keepalive -- it is
+    corruption, and it must keep reaching `decode_message`'s ValueError
+    rather than being silently discarded, which is precisely the failure
+    this predicate must not become a blanket except-clause for. Accepts
+    `str` or `bytes` because a WebSocket peer chooses the frame type.
+    """
+    if raw is None:
+        return True
+    if isinstance(raw, (bytes, bytearray)):
+        return not raw.strip()
+    return not str(raw).strip()
+
+
+@dataclass(frozen=True)
+class SdpCandidate:
+    """One `a=candidate:` line, with the m= section it belongs to."""
+
+    candidate: str
+    sdp_mid: str | None
+    sdp_mline_index: int
+
+
+def sdp_candidate_lines(sdp: str) -> list[SdpCandidate]:
+    """Pull the ICE candidates out of a local SDP, per m= section.
+
+    A candidate is attributed to the m= section it FOLLOWS -- sending them
+    all under `sdpMLineIndex: 0` would misattribute every candidate of every
+    section after the first. The leading `a=` is stripped: it is SDP
+    framing, and the signalling payload carries the bare `candidate:...`
+    string (the same form the far side sends us).
+    """
+    out: list[SdpCandidate] = []
+    index = -1
+    mid: str | None = None
+    for line in sdp.splitlines():
+        line = line.strip()
+        if line.startswith("m="):
+            index += 1
+            mid = None
+        elif line.startswith("a=mid:"):
+            mid = line[len("a=mid:"):].strip()
+        elif line.startswith("a=candidate:"):
+            if index < 0:
+                # A candidate before any m= section is malformed SDP; there
+                # is no section to attribute it to, so skip rather than
+                # invent index 0.
+                continue
+            out.append(SdpCandidate(line[2:], mid, index))
+    return out
+
+
+def encode_ice_candidate(
+    candidate: str, sdp_mid: str | None, sdp_mline_index: int
+) -> str:
+    """Build the ICE_CANDIDATE message a viewer sends to the master.
+
+    Required, not optional: the KVS C SDK master does not adopt candidates
+    from the offer SDP alone. Without these messages it forms no valid
+    candidate pair, never sends the DTLS ClientHello (it answers
+    `a=setup:active`, making it the DTLS client), and drops the session
+    after ~30s -- verified live against a real channel.
+
+    Outgoing messages use `action`; incoming ones use `messageType` (see
+    `decode_message`). A viewer omits `recipientClientId`: the master is the
+    implicit recipient, which is how the offer itself is routed.
+    """
+    payload = json.dumps({
+        "candidate": candidate,
+        "sdpMid": sdp_mid,
+        "sdpMLineIndex": sdp_mline_index,
+    }).encode("utf-8")
+    return json.dumps({
+        "action": "ICE_CANDIDATE",
+        "messagePayload": base64.b64encode(payload).decode("ascii"),
+    })
 
 
 def decode_message(raw: str) -> tuple[str, str, dict]:
@@ -123,6 +294,14 @@ def decode_message(raw: str) -> tuple[str, str, dict]:
 
     message_type = envelope.get("messageType")
     sender_client_id = envelope.get("senderClientId")
+
+    # STATUS_RESPONSE carries a `statusResponse` object and NO messagePayload.
+    # The SDK dispatches it as a first-class message type (SignalingClient.ts);
+    # treating it as corruption would discard the service's own error reports,
+    # which are exactly what you want when a session misbehaves.
+    if envelope.get("statusResponse") is not None and not envelope.get("messagePayload"):
+        return message_type, sender_client_id, dict(envelope["statusResponse"])
+
     raw_payload = envelope.get("messagePayload", "")
 
     try:

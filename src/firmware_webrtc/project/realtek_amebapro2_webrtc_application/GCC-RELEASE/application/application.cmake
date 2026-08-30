@@ -515,13 +515,7 @@ list(
 	${sdk_root}/component/soc/8735b/misc/driver/mpu_protect.c	
 )
 
-#RTSP
-list(
-	APPEND app_sources
-	${sdk_root}/component/network/rtsp/rtp_api.c
-	${sdk_root}/component/network/rtsp/rtsp_api.c
-	${sdk_root}/component/network/rtsp/sdp.c
-)
+#RTSP: removed -- this application streams over WebRTC only.
 
 #VIDEO
 list(

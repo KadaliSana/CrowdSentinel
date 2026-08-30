@@ -1,6 +1,8 @@
 """Wires source -> flow -> grid -> metrics into a stream of MetricsFrames."""
 from __future__ import annotations
 
+import math
+
 from dataclasses import dataclass, field
 from typing import Dict, Iterator, Optional
 
@@ -65,6 +67,24 @@ class Pipeline:
                 continue
 
             flow = self.flow_estimator.estimate(prev.image, frame.image)
+
+            # Optical flow measures displacement between THESE TWO frames, so
+            # the rate that converts it to a velocity is 1/(their gap), not
+            # the nominal capture rate. On a live stream FrameBridge drops
+            # frames, so the gap is routinely many times 1/fps -- and pressure
+            # goes as rate**2, so using the nominal fps overstates it by the
+            # square of the drop factor. Verified live: a 0.201s median gap
+            # against a nominal 29.41 fps inflated peak pressure ~35x and
+            # fired a false CRITICAL alert.
+            dt = frame.timestamp - prev.timestamp
+            if math.isfinite(dt) and dt > 0:
+                effective_fps = 1.0 / dt
+            else:
+                # Equal or backwards timestamps: a restart or a source with no
+                # usable clock. The nominal rate is the only sane fallback,
+                # and it must not divide by zero or invert the velocities.
+                effective_fps = self.fps
+
             prev = frame
 
             try:
@@ -78,7 +98,7 @@ class Pipeline:
                 total = NAN
                 confidence = 0.0
 
-            cells = self.grid.aggregate(flow, counts, fps=self.fps)
+            cells = self.grid.aggregate(flow, counts, fps=effective_fps)
             pressures = cells["pressure"]
             mean_p = float(np.nanmean(pressures)) if np.isfinite(pressures).any() else NAN
             max_p = float(np.nanmax(pressures)) if np.isfinite(pressures).any() else NAN

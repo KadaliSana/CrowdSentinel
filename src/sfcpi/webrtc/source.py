@@ -18,7 +18,6 @@ import asyncio
 import statistics
 import threading
 import time
-import uuid
 from typing import Any, Iterator, List, Optional
 
 import numpy as np
@@ -26,7 +25,169 @@ import numpy as np
 from sfcpi.sources import Frame
 
 from .bridge import FrameBridge
-from .signaling import decode_message, encode_sdp_offer, sign_wss_url
+from .metadata import parse_detection_message
+from .signaling import (decode_message, encode_ice_candidate, encode_sdp_offer,
+                        is_keepalive, keep_single_fingerprint,
+                        sdp_candidate_lines, sign_wss_url)
+
+
+# Label of the data channel this viewer opens. The board pushes detections
+# on every open channel, so the label is ours to choose.
+DETECTION_CHANNEL_LABEL = "sfcpi"
+
+# `websockets` defaults to ping_interval=20 and ping_timeout=20, so the CLIENT
+# closes the KVS signalling socket ~40s in if one pong is missed -- which is
+# exactly how long sessions were lasting. KVS drives its own keepalive (the
+# board logs `wss ping ==>` / `<== wss pong`), so we do not police it here.
+SIGNALLING_PING_INTERVAL_S = 20
+SIGNALLING_PING_TIMEOUT_S = None  # never close on a missed pong
+
+
+def local_host_addresses(sdp: str) -> list:
+    """The IPv4 addresses of our own `typ host` candidates, from our offer.
+
+    Our own gathered candidates are the cheapest, most accurate statement of
+    which subnets this machine actually sits on -- no interface enumeration
+    and no extra dependency.
+    """
+    out = []
+    for line in sdp.splitlines():
+        line = line.strip()
+        if not line.startswith("a=candidate:") or " typ host" not in line:
+            continue
+        parts = line.split()
+        if len(parts) > 4:
+            out.append(parts[4])
+    return out
+
+
+def is_reachable_candidate(candidate: str, local_addresses) -> bool:
+    """False only for a private HOST candidate on a subnet we are not on.
+
+    AWS TURN answers `403 Forbidden IP` when asked to relay to an address it
+    considers unroutable, which leaves an unretrieved-task traceback in the
+    log and wastes connectivity checks on a pair that cannot work.
+
+    Deliberately narrow, and biased towards KEEPING candidates:
+      - srflx / relay / prflx / anything unparsed -> kept
+      - public host addresses -> kept
+      - private host addresses -> kept ONLY if we hold an address in the same
+        /24, i.e. a genuinely same-LAN peer, whose host candidate is the
+        FASTEST path available and must never be discarded.
+    ICE tolerates a useless candidate far better than a missing one.
+    """
+    import ipaddress
+
+    if not local_addresses:
+        return True
+    parts = candidate.split()
+    if len(parts) < 8 or "typ" not in parts:
+        return True
+    try:
+        typ = parts[parts.index("typ") + 1]
+        address = ipaddress.ip_address(parts[4])
+    except (ValueError, IndexError):
+        return True
+    if typ != "host" or not address.is_private:
+        return True
+
+    for local in local_addresses:
+        try:
+            mine = ipaddress.ip_address(local)
+        except ValueError:
+            continue
+        if mine.version != address.version:
+            continue
+        net = ipaddress.ip_network(f"{local}/24", strict=False)
+        if address in net:
+            return True
+    return False
+
+
+def _is_media_ended(exc: BaseException) -> bool:
+    """True when a media track simply ended, as opposed to genuinely failing."""
+    try:
+        from aiortc.mediastreams import MediaStreamError
+    except ImportError:  # pragma: no cover - connect-path dependency
+        return False
+    return isinstance(exc, MediaStreamError)
+
+
+def _is_connection_closed(exc: BaseException) -> bool:
+    """True for a websocket closure, identified by class not message text."""
+    try:
+        from websockets.exceptions import ConnectionClosed
+    except ImportError:  # pragma: no cover - connect-path dependency
+        return False
+    return isinstance(exc, ConnectionClosed)
+
+
+# aiortc name-mangles this on RTCRtpReceiver. Named once, with a canary test
+# (tests/sfcpi/test_webrtc_nack.py) so an aiortc upgrade that renames it fails
+# loudly in CI instead of silently bringing back 38-second sessions.
+NACK_GENERATOR_ATTR = "_RTCRtpReceiver__nack_generator"
+REMB_ESTIMATOR_ATTR = "_RTCRtpReceiver__remote_bitrate_estimator"
+
+
+def disable_nack(pc) -> int:
+    """Stop this peer connection sending RTCP NACK. Returns how many were off.
+
+    The board cannot parse NACK (`PEER_CONNECTION_RESULT_FAIL_RTCP_PARSE_NACK`,
+    result 36 in its log). That would be harmless on its own -- a retransmit
+    request nobody honours -- except that the board refreshes its 30s
+    INACTIVITY timer only when SRTCP handling SUCCEEDS
+    (`HandleNonStunPackets`, peer_connection.c:1108). A rejected packet is
+    therefore a missed keepalive, and the session is closed as idle roughly
+    38s after it opens: 30s of timeout plus the time to connect.
+
+    Editing the offer's `a=rtcp-fb` lines does NOT work: aiortc builds a
+    NackGenerator for every video receiver unconditionally, without consulting
+    the negotiated feedback (rtcrtpreceiver.py). It has to be cleared here.
+
+    The cost is losing packet-loss retransmission, which this board never
+    honoured anyway -- it could not read the requests.
+    """
+    disabled = 0
+    for transceiver in pc.getTransceivers():
+        receiver = getattr(transceiver, "receiver", None)
+        if receiver is None:
+            continue
+        for attr in (NACK_GENERATOR_ATTR, REMB_ESTIMATOR_ATTR):
+            # REMB too: the board has a matching parser failure
+            # (PEER_CONNECTION_RESULT_FAIL_RTCP_PARSE_REMB, 35) and the same
+            # consequence -- a packet it cannot parse is a keepalive it does
+            # not count. Leaving only plain receiver reports, which are the
+            # one RTCP type it has no dedicated failure code for.
+            if getattr(receiver, attr, None) is not None:
+                setattr(receiver, attr, None)
+                disabled += 1
+    return disabled
+
+
+def default_client_id(host: str | None = None) -> str:
+    """A STABLE viewer identity for this machine.
+
+    The board keys its session table on the remote client id
+    (`AppCommon_GetPeerConnectionSession` in app_common.c): a matching id
+    reuses that session slot, a new one consumes a free slot. Slots are
+    limited (`AWS_MAX_VIEWER_NUM`, 2 on this board) and are only released by
+    the board's own close timer, so minting a fresh uuid4() per connect --
+    which is what this used to do -- means every reconnect burns another
+    slot. After a couple of reconnects both are held by ghosts of THIS
+    process: signalling still answers, the SDP exchange still completes, and
+    no session is left to carry media. That failure looks exactly like "the
+    board stopped sending video".
+
+    Stable per machine, distinct between machines, so two viewers of the same
+    board do not fight over one slot.
+    """
+    import hashlib
+    import socket
+
+    name = host if host is not None else socket.gethostname()
+    digest = hashlib.sha1(name.encode("utf-8", "replace")).hexdigest()[:12]
+    return f"sfcpi-viewer-{digest}"
+
 
 
 class WebRTCSource:
@@ -44,11 +205,35 @@ class WebRTCSource:
         warmup_frames: int = 10,
         connect_timeout_s: float = 15.0,
         maxsize: int = 8,
+        detector: Optional[Any] = None,
+        data_channel: bool = True,
     ) -> None:
         if warmup_frames < 1:
             raise ValueError("warmup_frames must be >= 1")
         self.signaling = signaling
         self.warmup_frames = warmup_frames
+        # BoardDetector (or anything with .update); fed from the data channel
+        # so counts come from the board's NPU rather than a second, disagreeing
+        # host-side model run over video that already has the board's boxes
+        # drawn into it.
+        self.detector = detector
+        # The AWS JS SDK makes the data channel a choice
+        # (`if (formValues.openDataChannel)`). Ours defaults ON because the
+        # board sends its detections there -- but offering an m=application
+        # section a master answers without makes aiortc raise "Media sections
+        # in answer do not match offer" and fails the whole connection, so it
+        # must be switchable.
+        self.data_channel = data_channel
+        self.metadata_errors = 0
+        # Media liveness, reported rather than acted on. The reference viewer
+        # never tears a session down on connection state; nor do we.
+        self.frames_received = 0
+        self.media_ended = False
+        # Our own host addresses, learned from our offer once it exists.
+        self._local_hosts: List[str] = []
+        self.filtered_candidates = 0
+        # STATUS_RESPONSE messages from KVS (its own error channel).
+        self.status_responses: List[Any] = []
         self.connect_timeout_s = connect_timeout_s
         self._bridge = bridge if bridge is not None else FrameBridge(maxsize=maxsize)
         self._index = 0
@@ -203,9 +388,17 @@ class WebRTCSource:
         starting any thread or event loop, so a misconfigured channel fails
         immediately with a RuntimeError instead of hanging until the timeout.
 
-        Blocks the calling thread until the remote video track starts
-        flowing, or raises TimeoutError naming whichever phase -- "signalling
+        Blocks the calling thread until the remote video track OBJECT
+        exists, or raises TimeoutError naming whichever phase -- "signalling
         connect" or "ICE/media negotiation" -- did not complete in time.
+
+        Returning is NOT proof that media is flowing: aiortc fires its
+        `track` event during setRemoteDescription, before ICE nomination and
+        before the DTLS handshake. Verified live against real KVS -- a
+        master that negotiates fully and then sends zero RTP still gets you
+        a clean return here. The media confirmation is the first frame out
+        of FrameBridge; a silent producer surfaces there as
+        `TimeoutError: no frame within ...`, not from this method.
 
         The WSS URL is SigV4-signed before use (real KVS requires this; the
         handshake can't carry a normal Authorization header). `credentials`
@@ -238,7 +431,7 @@ class WebRTCSource:
                 f"kinesisvideo:GetSignalingChannelEndpoint"
             )
 
-        client_id = client_id or f"sfcpi-viewer-{uuid.uuid4().hex[:12]}"
+        client_id = client_id or default_client_id()
 
         channel_arn = getattr(self.signaling, "channel_arn", None)
         if channel_arn:
@@ -342,7 +535,12 @@ class WebRTCSource:
         try:
             remaining = max(0.0, deadline - loop.time())
             ws = await asyncio.wait_for(
-                websockets.connect(wss_url), timeout=remaining
+                websockets.connect(
+                    wss_url,
+                    ping_interval=SIGNALLING_PING_INTERVAL_S,
+                    ping_timeout=SIGNALLING_PING_TIMEOUT_S,
+                ),
+                timeout=remaining
             )
         except Exception as exc:
             raise TimeoutError(
@@ -383,6 +581,25 @@ class WebRTCSource:
         # no event ever coming to wake it up.
         pc.addTransceiver("video", direction="recvonly")
 
+        # The board only allocates SCTP when the REMOTE offer enables a data
+        # channel (peer_connection.c: ucEnableDataChannelRemote), so this
+        # createDataChannel is what puts the m=application section in our
+        # offer. Without it the detections have nowhere to go.
+        own_channel = None
+        if self.data_channel:
+            try:
+                own_channel = pc.createDataChannel(DETECTION_CHANNEL_LABEL)
+            except Exception:  # noqa: BLE001 - a peer with no SCTP still streams video
+                own_channel = None
+        if own_channel is not None:
+            self._attach_detection_handler(own_channel)
+
+        # The board pushes on EVERY open channel on its session, including
+        # ones it opened itself.
+        @pc.on("datachannel")
+        def on_datachannel(channel: Any) -> None:
+            self._attach_detection_handler(channel)
+
         @pc.on("track")
         def on_track(track: Any) -> None:
             if track.kind == "video":
@@ -392,18 +609,71 @@ class WebRTCSource:
         offer = await pc.createOffer()
         await pc.setLocalDescription(offer)
         await self._await_ice_gathering_complete(pc)
-        await ws.send(encode_sdp_offer(client_id, pc.localDescription.sdp))
+        # aiortc advertises sha-256, sha-384 AND sha-512 fingerprints; the
+        # KVS C SDK master rejects the 191-character sha-512 one and then
+        # fails certificate verification, tearing the session down AFTER our
+        # own DTLS reports success. Send only sha-256, as a browser does.
+        self._local_hosts = local_host_addresses(pc.localDescription.sdp)
+        offer_sdp = keep_single_fingerprint(pc.localDescription.sdp)
+        await ws.send(encode_sdp_offer(client_id, offer_sdp))
+
+        # Trickle our own candidates. The offer already carries them in its
+        # SDP (we gather-then-send), but the KVS C SDK master does not adopt
+        # them from there: without these messages it forms no valid pair,
+        # never sends the DTLS ClientHello, and drops the session after ~30s.
+        # Verified live -- see tests/sfcpi/test_webrtc_trickle.py.
+        for candidate in sdp_candidate_lines(pc.localDescription.sdp):
+            await ws.send(encode_ice_candidate(
+                candidate.candidate, candidate.sdp_mid, candidate.sdp_mline_index
+            ))
+
+        # Candidates that arrive BEFORE the answer must be queued, not dropped:
+        # setRemoteDescription has not run yet, so addIceCandidate cannot be
+        # called. The AWS JS SDK does exactly this (emitOrQueueIceCandidate,
+        # replayed by emitPendingIceCandidates once the remote SDP lands).
+        # Observed live: the board sends its HOST candidate -- the fastest
+        # path -- before the answer, so dropping them cost the best route on
+        # every single session.
+        pending_candidates = []
 
         while True:
             raw = await ws.recv()
+            # Real KVS's FIRST frame after the offer is an empty keepalive;
+            # decode_message rightly calls that malformed, so skip it here
+            # rather than weakening decode_message. See signaling.is_keepalive.
+            if is_keepalive(raw):
+                continue
             message_type, _sender, payload = decode_message(raw)
+            if message_type == "ICE_CANDIDATE":
+                pending_candidates.append(payload)
+                continue
+            if message_type == "STATUS_RESPONSE":
+                # The service's own error channel. Surfacing it beats guessing
+                # why a session misbehaved.
+                self.status_responses.append(payload)
+                continue
             if message_type == "SDP_ANSWER":
+                # The SDK guards this: "Ignoring SDP answer in signaling state".
+                # Applying a second answer once we are 'stable' raises inside
+                # aiortc and would kill an otherwise healthy session.
+                state = getattr(pc, "signalingState", "have-local-offer")
+                if state != "have-local-offer":
+                    continue
                 await pc.setRemoteDescription(
                     aiortc.RTCSessionDescription(
                         sdp=payload["sdp"], type=payload["type"]
                     )
                 )
                 break
+
+        # Must happen after setRemoteDescription: the receivers only exist
+        # once the answer has been applied.
+        disable_nack(pc)
+
+        # Replay whatever arrived before the answer, now that the remote
+        # description exists.
+        for payload in pending_candidates:
+            await self._add_remote_candidate(pc, payload)
 
         self._signalling_task = asyncio.ensure_future(
             self._pump_ice_candidates(ws, pc)
@@ -423,6 +693,24 @@ class WebRTCSource:
 
         await done
 
+    async def _add_remote_candidate(self, pc: Any, payload: dict) -> None:
+        """Apply one remote ICE candidate. Shared by the pre-answer replay and
+        the post-answer pump so both handle malformed entries identically."""
+        candidate_str = payload.get("candidate")
+        if not candidate_str:
+            return
+        if not is_reachable_candidate(candidate_str, self._local_hosts):
+            # Unroutable private host candidate: handing it to TURN yields
+            # `403 Forbidden IP`. See is_reachable_candidate.
+            self.filtered_candidates += 1
+            return
+        from aiortc.sdp import candidate_from_sdp
+
+        candidate = candidate_from_sdp(candidate_str)
+        candidate.sdpMid = payload.get("sdpMid")
+        candidate.sdpMLineIndex = payload.get("sdpMLineIndex")
+        await pc.addIceCandidate(candidate)
+
     async def _pump_ice_candidates(self, ws: Any, pc: Any) -> None:
         """Apply trickled ICE candidates the far side sends after the answer.
 
@@ -433,6 +721,10 @@ class WebRTCSource:
         """
         try:
             async for raw in ws:
+                # Keepalives keep arriving for the life of the session; one
+                # reaching decode_message would fail() the whole stream.
+                if is_keepalive(raw):
+                    continue
                 message_type, _sender, payload = decode_message(raw)
                 if message_type != "ICE_CANDIDATE":
                     continue
@@ -447,8 +739,35 @@ class WebRTCSource:
                 await pc.addIceCandidate(candidate)
         except asyncio.CancelledError:
             raise
-        except BaseException as exc:  # noqa: BLE001 - never swallow a producer error
+        except Exception as exc:  # noqa: BLE001
+            # A CLOSED signalling socket is not a media failure. WebRTC
+            # media has its own ICE/DTLS transport; signalling exists to
+            # set the session up and trickle candidates. Tearing down a
+            # healthy video stream because this socket went away is the
+            # bug that made every session last ~40s (websockets closes it
+            # itself on ping_interval=20 + ping_timeout=20). Anything
+            # else still reaches the consumer: a real producer fault must
+            # never become a silently empty -- and falsely calm -- stream.
+            if _is_connection_closed(exc):
+                return
             self.fail(exc)
+
+    def _attach_detection_handler(self, channel: Any) -> None:
+        """Route data-channel messages into the detector."""
+
+        @channel.on("message")
+        def on_message(message: Any) -> None:
+            if self.detector is None:
+                return
+            try:
+                self.detector.update(parse_detection_message(message))
+            except ValueError:
+                # A malformed message must NOT fail() the stream -- the video
+                # is fine and the board is still there. It must also not leave
+                # the previous count standing as fresh: not calling update()
+                # means the detector ages out on its own and the pipeline
+                # reports an unknown count rather than a stale crowd.
+                self.metadata_errors += 1
 
     async def _recv_loop(self, track: Any) -> None:
         """Pull decoded frames off an aiortc MediaStreamTrack and feed() them.
@@ -459,16 +778,53 @@ class WebRTCSource:
         downstream, which is exactly the failure mode this project exists to
         avoid.
         """
+        loop = asyncio.get_event_loop()
         try:
             while True:
                 frame = await track.recv()
                 timestamp = getattr(frame, "time", None)
                 if timestamp is None:
                     timestamp = time.monotonic()
-                self.feed(frame, timestamp)
+                # Convert OFF the event loop. `to_ndarray(format="bgr24")` is a
+                # full YUV->BGR conversion of a 1280x704 frame; doing it here
+                # synchronously at 30fps starves the loop that also has to send
+                # ICE consent checks and RTCP, and a starved connection dies.
+                # PyAV releases the GIL for the conversion, so a worker thread
+                # genuinely buys us the loop back.
+                #
+                # feed() re-runs _as_bgr_ndarray, which is a no-op for an
+                # ndarray, so passing the converted image through is safe and
+                # keeps one code path for both callers.
+                image = await loop.run_in_executor(
+                    None, self._as_bgr_ndarray, frame
+                )
+                self.feed(image, timestamp)
+                self.frames_received += 1
         except asyncio.CancelledError:
             raise
-        except BaseException as exc:  # noqa: BLE001 - never swallow a producer error
+        except Exception as exc:  # noqa: BLE001
+            # A track ENDING is not a session failure. aiortc raises
+            # MediaStreamError when a track simply stops, and the AWS JS SDK's
+            # viewer never tears a session down on connection state -- its
+            # connectionstatechange handler only logs. Killing the session here
+            # also throws away the DATA CHANNEL, which rides its own SCTP
+            # transport and carries the board's detection counts: the input the
+            # risk engine actually runs on. Record it and let the caller decide.
+            #
+            # Everything else still reaches the consumer. A real producer fault
+            # must never become a silently empty -- and therefore falsely calm
+            # -- stream.
+            if _is_media_ended(exc):
+                # A clean END of media, not a fault. Close the bridge so the
+                # consumer's iteration finishes instead of blocking forever:
+                # the bridge has no idle timeout, so without this the stream
+                # simply stops and is never picked back up. Closing (rather
+                # than failing) lets the caller start a FRESH session after the
+                # board's slot-reclaim wait, without recording an error that
+                # never happened.
+                self.media_ended = True
+                self._bridge.close()
+                return
             self.fail(exc)
 
     async def _shutdown_connect(self) -> None:

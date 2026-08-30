@@ -6,7 +6,6 @@ enable_language(C CXX ASM)
 list(
     APPEND app_sources
     ${sdk_root}/component/media/mmfv2/module_video.c
-    ${sdk_root}/component/media/mmfv2/module_rtsp2.c
     ${sdk_root}/component/media/mmfv2/module_array.c
     ${sdk_root}/component/media/mmfv2/module_audio.c
     ${sdk_root}/component/media/mmfv2/module_aac.c

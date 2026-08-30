@@ -48,7 +48,12 @@ extern "C" {
 #include "rtp_pkt_queue.h"
 #include "rtcp_data_types.h"
 
-#define PEER_CONNECTION_TRANSCEIVER_MAX_COUNT ( 2 )
+/* Raised from 2. A viewer that also opens a DATA CHANNEL sends three m=
+ * sections (video, audio-or-none, application), and the board logged
+ *     [WARN] SetPayloadType: Cannot not store more transceiver pointers.
+ * immediately before a heap assertion during teardown. Two pointer slots per
+ * array is 8 bytes each; four costs 16, which is free on this part. */
+#define PEER_CONNECTION_TRANSCEIVER_MAX_COUNT ( 4 )
 #define PEER_CONNECTION_USER_NAME_LENGTH ( 32 )
 #define PEER_CONNECTION_PASSWORD_LENGTH ( 32 )
 #define PEER_CONNECTION_CNAME_LENGTH ( 40 )

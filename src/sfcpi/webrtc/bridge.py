@@ -16,11 +16,21 @@ _SENTINEL = object()
 
 
 class FrameBridge:
-    def __init__(self, maxsize: int = 8, timeout_s: float = 10.0) -> None:
+    def __init__(self, maxsize: int = 8, timeout_s: Optional[float] = None) -> None:
+        """`timeout_s=None` (the default) waits indefinitely for a frame.
+
+        A gap in frames is NOT evidence of a dead connection: WebRTC media
+        rides its own ICE/DTLS transport, and a stall says nothing about
+        whether the peer connection is alive. Raising TimeoutError here used
+        to abort the session on a 10s gap -- turning a hiccup into a teardown.
+        A genuinely dead producer still reaches the consumer, because
+        _recv_loop calls fail() on the real error and close() ends iteration.
+        Set a number only if a caller truly wants a deadline.
+        """
         if maxsize < 1:
             raise ValueError("maxsize must be >= 1")
-        if timeout_s <= 0:
-            raise ValueError("timeout_s must be positive")
+        if timeout_s is not None and timeout_s <= 0:
+            raise ValueError("timeout_s must be positive when set")
         # Internal capacity is maxsize+1: the extra slot is reserved for the
         # close() sentinel so shutdown never has to evict a real data item
         # (and therefore never over-counts .dropped) to make room for it.
@@ -77,7 +87,8 @@ class FrameBridge:
     def __iter__(self) -> Iterator[Any]:
         while True:
             try:
-                item = self._q.get(timeout=self._timeout_s)
+                item = self._q.get(timeout=self._timeout_s) \
+                    if self._timeout_s is not None else self._q.get()
             except queue.Empty:
                 raise TimeoutError(
                     f"no frame within {self._timeout_s}s; the producer is silent or dead"

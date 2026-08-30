@@ -55,7 +55,13 @@ def test_encode_sdp_offer_is_base64_json():
     raw = encode_sdp_offer("viewer-1", "v=0\r\no=- 1 1 IN IP4 0.0.0.0\r\n")
     msg = json.loads(raw)
     assert msg["action"] == "SDP_OFFER"
-    assert msg["recipientClientId"] == "viewer-1"
+    # A VIEWER must NOT send recipientClientId. This assertion used to require
+    # the opposite -- it encoded a real defect: we addressed the offer to our
+    # own client id. The AWS JS SDK documents the field as "Required for
+    # 'MASTER' role. Should not be present for 'VIEWER' role" and its
+    # validateRecipientClientId() throws when a viewer supplies one.
+    # See tests/sfcpi/test_webrtc_sdk_conformance.py.
+    assert "recipientClientId" not in msg
     decoded = json.loads(base64.b64decode(msg["messagePayload"]))
     assert decoded["type"] == "offer" and decoded["sdp"].startswith("v=0")
 

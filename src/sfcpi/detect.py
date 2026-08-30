@@ -42,6 +42,62 @@ class FixedDetector:
         return self._detections
 
 
+class BoardDetector:
+    """Serves detections computed on the AmebaPro2's NPU, not on this host.
+
+    The board already runs SCRFD per frame; re-detecting here would burn CPU
+    to produce a SECOND, disagreeing set of boxes over a video that already
+    has the board's boxes drawn into it. This detector just holds the most
+    recent data-channel message.
+
+    Two states are deliberately errors rather than empty lists, matching
+    NullDetector: nothing received yet, and a message too old to trust. Both
+    mean "the count is unknown", and the pipeline's fail-loud path turns that
+    into NaN with sensing_confidence 0 -- never into a calm, empty scene.
+    """
+
+    def __init__(self, max_age_s: float = 2.0) -> None:
+        if max_age_s <= 0:
+            raise ValueError("max_age_s must be positive")
+        self.max_age_s = max_age_s
+        self._latest = None
+        self._received_at = None
+
+    def update(self, detections, now: float = None) -> None:
+        """Called by the data-channel handler for each board message."""
+        import time as _time
+
+        self._latest = detections
+        self._received_at = _time.monotonic() if now is None else now
+
+    @property
+    def last_count(self):
+        """The board's TRUE count, which may exceed len(detect(...))."""
+        return None if self._latest is None else self._latest.count
+
+    @property
+    def last(self):
+        return self._latest
+
+    def detect(self, image: np.ndarray, now: float = None) -> List[Detection]:
+        import time as _time
+
+        if self._latest is None:
+            raise RuntimeError(
+                "BoardDetector: no detection metadata received from the board "
+                "yet; the count is unknown, not zero"
+            )
+        current = _time.monotonic() if now is None else now
+        age = current - self._received_at
+        if age > self.max_age_s:
+            raise RuntimeError(
+                f"BoardDetector: detection metadata is stale ({age:.1f}s old, "
+                f"limit {self.max_age_s}s); the count is unknown, not the last "
+                f"one seen"
+            )
+        return list(self._latest.detections)
+
+
 class NullDetector:
     """Flow-only mode: a detector that is explicitly ABSENT, not empty.
 
