@@ -255,6 +255,31 @@ static mm_context_t * pVideoNnContext = NULL;
 static mm_context_t * pVipnnContext = NULL;
 static mm_siso_t * pSisoNnVipnn = NULL;
 
+
+/* ---- detection metadata -> WebRTC data channel -------------------------
+ *
+ * The NN results below are drawn into the video as OSD rectangles, which no
+ * remote consumer can read as numbers. This hands the same results to the
+ * app layer as JSON so it can push them down the data channel; master.c
+ * registers the sink. Registration is optional -- when nothing is
+ * registered the NN path behaves exactly as before.
+ */
+static OnMetadataReadyToSend_t pMetadataSink = NULL;
+static void * pMetadataSinkContext = NULL;
+
+/* One inference's worth of JSON. Bounded on purpose: this runs on the NN
+ * callback, so it must not allocate and must not grow without limit when a
+ * dense crowd produces many faces. */
+#define MEDIA_PORT_METADATA_MAX_DETECTIONS  ( 64 )
+#define MEDIA_PORT_METADATA_BUFFER_SIZE     ( 2560 )
+
+void AppMediaSourcePort_RegisterMetadataSink( OnMetadataReadyToSend_t onMetadataReadyToSendFunc,
+                                              void * pOnMetadataReadyToSendCustomContext )
+{
+    pMetadataSink = onMetadataReadyToSendFunc;
+    pMetadataSinkContext = pOnMetadataReadyToSendCustomContext;
+}
+
 static void NnDetectionResultCallback( void * p,
                                        void * img_param )
 {
@@ -270,6 +295,34 @@ static void NnDetectionResultCallback( void * p,
     }
 
     pRes = ( media_port_nn_res_t * ) &( pOut->res[ 0 ] );
+
+    /* Detection metadata for the data channel. Built alongside the OSD draw
+     * so both describe exactly the same inference. Emitted even when
+     * res_cnt == 0: a zero count is a real observation (the crowd cleared),
+     * and a consumer must be able to tell it apart from the board having
+     * gone silent. */
+    /* STATIC, not on the stack: 2.5 KB of automatic storage on the NN
+     * callback risks overflowing a FreeRTOS task stack, and a stack
+     * overflow on this board presents as the same silent hard fault as
+     * the memcpy32 defect. Safe because the NN callback is driven by a
+     * single task and is not reentrant. */
+    static char metaJson[ MEDIA_PORT_METADATA_BUFFER_SIZE ];
+    int metaLen = 0;
+    int metaEmitted = 0;
+    int metaTruncated = 0;
+
+    if( pMetadataSink != NULL )
+    {
+        metaLen = snprintf( metaJson, sizeof( metaJson ),
+                            "{\"t\":%llu,\"w\":%d,\"h\":%d,\"model\":\"scrfd\",\"d\":[",
+                            ( unsigned long long ) ( NetworkingUtils_GetCurrentTimeUs( NULL ) / 1000 ),
+                            ( int ) MEDIA_PORT_V1_WIDTH,
+                            ( int ) MEDIA_PORT_V1_HEIGHT );
+        if( metaLen < 0 )
+        {
+            metaLen = 0;
+        }
+    }
 
     canvas_create_bitmap( MEDIA_PORT_V1_CHANNEL, 0, RTS_OSD2_BLK_FMT_1BPP );
 
@@ -352,11 +405,64 @@ static void NnDetectionResultCallback( void * p,
                 char text_str[20];
                 snprintf( text_str, sizeof(text_str), "%s %d", coco_name_get_by_id( classId ), ( int ) ( pRes[ i ].result[ 1 ] * 100 ) );
                 canvas_set_text( MEDIA_PORT_V1_CHANNEL, 0, xmin, ymin - 32, text_str, COLOR_CYAN );
+
+                /* Same box, as numbers, for the data channel. Bounded on both
+                 * detection count and buffer space -- this runs on the NN
+                 * callback and must never overrun or block. */
+                if( ( pMetadataSink != NULL ) && ( metaLen > 0 ) )
+                {
+                    if( metaEmitted >= MEDIA_PORT_METADATA_MAX_DETECTIONS )
+                    {
+                        metaTruncated = 1;
+                    }
+                    else
+                    {
+                        int written = snprintf( metaJson + metaLen,
+                                                sizeof( metaJson ) - ( size_t ) metaLen,
+                                                "%s[%d,%d,%d,%d,%d]",
+                                                ( metaEmitted > 0 ) ? "," : "",
+                                                xmin, ymin, xmax - xmin, ymax - ymin,
+                                                ( int ) ( pRes[ i ].result[ 1 ] * 100 ) );
+                        /* snprintf returns what it WOULD have written: a value
+                         * at or past the remaining space means it truncated,
+                         * and metaLen must not advance past the buffer. */
+                        if( ( written < 0 ) ||
+                            ( ( size_t ) written >= sizeof( metaJson ) - ( size_t ) metaLen ) )
+                        {
+                            metaTruncated = 1;
+                        }
+                        else
+                        {
+                            metaLen += written;
+                            metaEmitted++;
+                        }
+                    }
+                }
             }
         }
     }
     
     canvas_update( MEDIA_PORT_V1_CHANNEL, 0, 1 );
+
+    if( ( pMetadataSink != NULL ) && ( metaLen > 0 ) )
+    {
+        int tail = snprintf( metaJson + metaLen,
+                             sizeof( metaJson ) - ( size_t ) metaLen,
+                             "],\"n\":%d,\"trunc\":%d}",
+                             ( int ) pOut->res_cnt,
+                             metaTruncated );
+
+        /* `n` is the TRUE detection count and `trunc` says whether the `d`
+         * array holds all of them. A consumer counting the array instead of
+         * reading `n` would silently under-report a dense crowd -- which is
+         * the one case this system exists to catch. */
+        if( ( tail > 0 ) &&
+            ( ( size_t ) tail < sizeof( metaJson ) - ( size_t ) metaLen ) )
+        {
+            metaLen += tail;
+            ( void ) pMetadataSink( pMetadataSinkContext, metaJson, ( uint32_t ) metaLen );
+        }
+    }
 }
 #endif /* ENABLE_NN_OBJECT_DETECTION */
 

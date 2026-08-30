@@ -3,182 +3,182 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>CrowdSentinel — Live Risk Monitor</title>
+  <title>CrowdSentinel — Crowd Pressure Field</title>
+
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-  <link href="https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Barlow+Condensed:wght@300;400;600;700;900&family=Barlow:wght@300;400&display=swap" rel="stylesheet"/>
-  
-  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
-  
-  <style>
-     /* Additional override to hide video when stopped */
-     #videoFeed { opacity: 0.2; transition: opacity 0.5s; }
-     #videoFeed.active { opacity: 1; }
-     .btn-cyber {
-        background: rgba(0, 255, 255, 0.1);
-        border: 1px solid #0ff;
-        color: #0ff;
-        padding: 10px 20px;
-        font-family: 'Share Tech Mono', monospace;
-        cursor: pointer;
-        text-transform: uppercase;
-        transition: all 0.3s;
-        margin-right: 10px;
-     }
-     .btn-cyber:hover { background: #0ff; color: #000; box-shadow: 0 0 15px #0ff; }
-     .btn-cyber.danger { border-color: #f00; color: #f00; background: rgba(255,0,0,0.1); }
-     .btn-cyber.danger:hover { background: #f00; color: #000; box-shadow: 0 0 15px #f00; }
-  </style>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600&family=Instrument+Serif&display=swap" />
+
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}" />
 </head>
 <body>
 
-  <div class="scanlines" aria-hidden="true"></div>
-  <div class="grain" aria-hidden="true"></div>
-
-  <header class="header">
-    <div class="header-left">
-      <div class="logo-mark">
-        <span class="logo-dot"></span><span class="logo-dot"></span><span class="logo-dot"></span>
-      </div>
+  <!-- ── INSTRUMENT RAIL ───────────────────────────────────────────────── -->
+  <header class="rail">
+    <div class="rail__id">
+      <svg class="mark" viewBox="0 0 24 24" aria-hidden="true">
+        <rect x="1"  y="1"  width="6" height="6" />
+        <rect x="9"  y="1"  width="6" height="6" />
+        <rect x="17" y="1"  width="6" height="6" />
+        <rect x="1"  y="9"  width="6" height="6" />
+        <rect x="9"  y="9"  width="6" height="6" class="mark__hot" />
+        <rect x="17" y="9"  width="6" height="6" />
+        <rect x="1"  y="17" width="6" height="6" />
+        <rect x="9"  y="17" width="6" height="6" />
+        <rect x="17" y="17" width="6" height="6" />
+      </svg>
       <div>
-        <h1 class="logo-text">CROWD<span>SENTINEL</span></h1>
-        <p class="logo-sub">AI-IoT Stampede Risk Prediction System</p>
+        <h1 class="wordmark">CrowdSentinel</h1>
+        <p class="tagline">Crowd pressure field &middot; AmebaPro2 / KVS WebRTC</p>
       </div>
     </div>
-    <div class="header-right">
-      <div class="live-badge" id="liveBadge" style="opacity: 0.3;">
-        <span class="pulse-ring"></span>
-        <span class="live-text">OFFLINE</span>
-      </div>
-      <div class="system-time" id="systemTime">--:--:--</div>
+
+    <div class="rail__meta">
+      <span class="meta"><span class="meta__k">Channel</span><span class="meta__v">{{ channel }}</span></span>
+      <span class="meta"><span class="meta__k">Region</span><span class="meta__v">{{ region }}</span></span>
+      <span class="meta"><span class="meta__k">Clock</span><span class="meta__v tnum" id="systemTime">--:--:--</span></span>
+      <span class="conn" id="liveBadge">
+        <span class="conn__dot" id="feedDot"></span>
+        <span class="conn__text" id="connText">Offline</span>
+      </span>
+      <button id="btnStreamToggle" class="btn" type="button" onclick="toggleSystem()">Start monitoring</button>
     </div>
   </header>
 
-  <main class="main-grid">
+  <main class="deck">
 
-    <section class="panel panel--feed">
-      <div class="panel-label">
-        <span class="label-icon">◈</span> LIVE FEED — AMB82 MINI / KVS
+    <!-- ── SIGNATURE: THE PRESSURE FIELD ───────────────────────────────── -->
+    <section class="panel panel--field">
+      <div class="panel__head">
+        <h2 class="panel__title">Pressure field</h2>
+        <div class="panel__tools">
+          <span class="panel__note tnum" id="gridNote">grid &mdash;</span>
+          <div class="seg" role="group" aria-label="Field view">
+            <button class="seg__btn is-on" id="btnOverlay" type="button" aria-pressed="true">Overlay</button>
+            <button class="seg__btn" id="btnFieldOnly" type="button" aria-pressed="false">Field only</button>
+          </div>
+        </div>
       </div>
-      <div class="feed-wrapper">
-        <img id="videoFeed" src="" alt="System Standby" />
-        
-        <div class="feed-overlay">
-          <div class="corner tl"></div><div class="corner tr"></div>
-          <div class="corner bl"></div><div class="corner br"></div>
+
+      <div class="stage" id="stage">
+        <img id="videoFeed" alt="Live camera view from the AmebaPro2 board" />
+        <div class="lattice" id="lattice" aria-hidden="true"></div>
+        <div class="stage__foot">
+          <span class="stage__status"><span class="dot" id="stageDot"></span><span id="feedStatusText">Standby</span></span>
+          <span class="stage__peak tnum" id="peakCellTag">peak cell &mdash;</span>
         </div>
-        <div class="feed-status">
-          <span class="feed-status__dot" id="feedDot"></span>
-          <span id="feedStatusText">SYSTEM STANDBY</span>
-        </div>
+      </div>
+
+      <div class="legend">
+        <span class="legend__cap">Cell pressure</span>
+        <span class="legend__end tnum">0</span>
+        <span class="legend__ramp" aria-hidden="true"></span>
+        <span class="legend__end tnum" id="legendMax">0.040 s&#8315;&sup2;</span>
+        <span class="legend__key"><i class="swatch swatch--over" aria-hidden="true"></i>over critical</span>
+        <span class="legend__key"><i class="swatch swatch--unmeasured" aria-hidden="true"></i>unmeasured</span>
       </div>
     </section>
 
-    <aside class="sidebar">
+    <!-- ── READOUT COLUMN ──────────────────────────────────────────────── -->
+    <aside class="readout">
 
-      <div class="card card--count">
-        <div class="card__label">DETECTED PERSONS</div>
-        <div class="count-display">
-          <span class="count-number" id="personCount">0</span>
-          <span class="count-unit">PPL</span>
-        </div>
-        <div class="count-bar-wrapper">
-          <div class="count-bar" id="countBar"></div>
-        </div>
-        <div class="count-meta">
-          <span>Threshold: <b id="threshVal">50</b></span>
-          <span>Peak: <b id="peakVal">0</b></span>
-        </div>
-      </div>
+      <section class="card card--pressure" id="pressureCard">
+        <p class="eyebrow">Crowd pressure &middot; hottest cell</p>
+        <p class="hero">
+          <span class="hero__val tnum" id="pressureVal">&mdash;</span>
+          <span class="hero__unit">s<sup>&minus;2</sup></span>
+        </p>
+        <p class="level" id="levelWord">Unknown</p>
 
-      <div class="card card--risk">
-        <div class="card__label">STAMPEDE RISK</div>
-        <div class="risk-ring-wrapper">
-          <svg class="risk-ring" viewBox="0 0 120 120">
-            <circle class="ring-bg" cx="60" cy="60" r="50" />
-            <circle class="ring-fill" id="riskRingFill" cx="60" cy="60" r="50" stroke-dasharray="314" stroke-dashoffset="314" />
-          </svg>
-          <div class="risk-center">
-            <div class="risk-pct" id="riskPct">0%</div>
-            <div class="risk-label" id="riskLabel">LOW</div>
+        <div class="scale">
+          <div class="scale__track" id="scaleTrack">
+            <div class="scale__fill" id="scaleFill"></div>
+            <div class="scale__needle" id="scaleNeedle"></div>
           </div>
+          <div class="scale__ticks" id="scaleTicks"></div>
         </div>
-        <div class="risk-zones">
-          <span class="zone zone--low">LOW</span>
-          <span class="zone zone--mod">MOD</span>
-          <span class="zone zone--high">HIGH</span>
-          <span class="zone zone--critical">CRIT</span>
-        </div>
-      </div>
-      
-      <div class="controls" style="margin: 20px 0; text-align: center;">
-        <input type="file" id="imgUpload" accept="image/*" style="display: none" />
-        
-        <button id="btnStreamToggle" class="btn-cyber" onclick="toggleSystem()">
-          INITIALIZE SYSTEM
-        </button>
+        <p class="scale__note">Levels hold until pressure falls below a lower release threshold (hysteresis), so the level can stay put while the needle drops.</p>
 
-        <button class="btn-cyber" onclick="document.getElementById('imgUpload').click()">
-          📂 UPLOAD IMG
-        </button>
-      </div>
+        <dl class="facts">
+          <div class="fact"><dt>Field mean</dt><dd class="tnum" id="meanPressure">&mdash;</dd></div>
+          <div class="fact"><dt>Sensing</dt><dd class="tnum" id="coverageVal">&mdash;</dd></div>
+        </dl>
 
-      <div class="card card--density">
-        <div class="card__label">CROWD DENSITY</div>
-        <div class="density-gauge">
-          <div class="density-col" id="dc0"></div><div class="density-col" id="dc1"></div>
-          <div class="density-col" id="dc2"></div><div class="density-col" id="dc3"></div>
-          <div class="density-col" id="dc4"></div><div class="density-col" id="dc5"></div>
-          <div class="density-col" id="dc6"></div><div class="density-col" id="dc7"></div>
+        <p class="footnote">
+          P = density &times; fps<sup>2</sup> &times; Var(velocity), in s<sup>&minus;2</sup>.
+          Headcount is only one term: 200 people standing still measure near zero,
+          15 people shoving in a doorway can measure critical.
+        </p>
+      </section>
+
+      <section class="card card--count">
+        <p class="eyebrow">People in frame &middot; board NPU</p>
+        <p class="count">
+          <span class="count__val tnum" id="personCount">&mdash;</span>
+          <span class="count__unit" id="countUnit">no data</span>
+        </p>
+        <p class="count__reason" id="countReason">Waiting for the first status</p>
+        <dl class="facts">
+          <div class="fact"><dt>Session peak</dt><dd class="tnum" id="peakVal">&mdash;</dd></div>
+          <div class="fact"><dt>Rolling average</dt><dd class="tnum" id="statAvg">&mdash;</dd></div>
+        </dl>
+        <p class="footnote">A count is a count. It is not a risk level on its own.</p>
+      </section>
+
+      <section class="card card--alert">
+        <p class="eyebrow">Last alert</p>
+        <p class="empty" id="alertEmpty">No alert from the state machine yet.</p>
+        <div class="lastalert" id="alertBody" hidden>
+          <p class="lastalert__head">
+            <span class="lvl" id="alertLevel">&mdash;</span>
+            <span class="lastalert__from">from</span>
+            <span class="lvl lvl--prev" id="alertPrev">&mdash;</span>
+          </p>
+          <p class="lastalert__meta"><span id="alertReason">&mdash;</span> &middot; <span id="alertAgo">&mdash;</span></p>
+          <p class="lastalert__msg" id="alertMessage"></p>
         </div>
-        <div class="density-labels">
-          <span>SPARSE</span><span>DENSE</span><span>CRITICAL</span>
-        </div>
-      </div>
+      </section>
 
     </aside>
 
-    <div class="alert-strip" id="alertStrip">
-      <span class="alert-icon" id="alertIcon">⚠</span>
-      <span class="alert-msg" id="alertMsg">SYSTEM STANDBY</span>
+    <!-- ── LEVEL BANNER ────────────────────────────────────────────────── -->
+    <div class="banner" id="alertStrip" role="status" aria-live="polite">
+      <span class="banner__mark" id="alertIcon">&#9632;</span>
+      <span class="banner__msg" id="alertMsg">Standby &mdash; pressure is not being measured.</span>
+      <span class="banner__val tnum" id="alertVal"></span>
     </div>
 
+    <!-- ── TIMELINE ────────────────────────────────────────────────────── -->
     <section class="panel panel--chart">
-      <div class="panel-label"><span class="label-icon">◈</span> CROWD COUNT TIMELINE</div>
-      <div class="chart-wrapper">
-        <canvas id="timelineChart"></canvas>
-        <div class="chart-grid" aria-hidden="true"></div>
+      <div class="panel__head">
+        <h2 class="panel__title">Timeline</h2>
+        <span class="panel__note">pressure s<sup>&minus;2</sup> (left) &middot; people (right) &middot; dashed rules are the level thresholds</span>
       </div>
+      <div class="chart"><canvas id="timelineChart"></canvas></div>
     </section>
 
-    <section class="stats-row">
-      <div class="stat-card">
-        <div class="stat-val" id="statAvg">—</div><div class="stat-key">AVG COUNT</div>
-      </div>
-      <div class="stat-card">
-        <div class="stat-val" id="statMax">—</div><div class="stat-key">SESSION PEAK</div>
-      </div>
-      <div class="stat-card">
-        <div class="stat-val" id="statAlerts">0</div><div class="stat-key">ALERTS FIRED</div>
-      </div>
-      <div class="stat-card">
-        <div class="stat-val" id="statUptime">00:00</div><div class="stat-key">UPTIME</div>
-      </div>
+    <!-- ── SESSION STRIP ───────────────────────────────────────────────── -->
+    <section class="strip">
+      <div class="stat"><span class="stat__v tnum" id="statPeakP">&mdash;</span><span class="stat__k">Peak pressure s<sup>&minus;2</sup></span></div>
+      <div class="stat"><span class="stat__v tnum" id="statAlerts">0</span><span class="stat__k">Alerts fired</span></div>
+      <div class="stat"><span class="stat__v tnum" id="statFrames">&mdash;</span><span class="stat__k">Frames / dropped</span></div>
+      <div class="stat"><span class="stat__v tnum" id="statUptime">00:00</span><span class="stat__k">Session uptime</span></div>
     </section>
 
   </main>
 
-  <div class="critical-overlay" id="criticalOverlay">
-    <div class="critical-box">
-      <div class="critical-icon">⚠</div>
-      <div class="critical-title">CRITICAL RISK DETECTED</div>
-      <div class="critical-sub">Crowd density exceeds safe threshold. Immediate action required.</div>
-      <button class="critical-dismiss" onclick="dismissCritical()">ACKNOWLEDGE</button>
+  <!-- ── CRITICAL KLAXON ──────────────────────────────────────────────── -->
+  <div class="klaxon" id="criticalOverlay" role="alertdialog" aria-modal="true"
+       aria-labelledby="klaxonTitle" aria-describedby="klaxonSub" hidden>
+    <div class="klaxon__box">
+      <p class="klaxon__eyebrow">SF-CPI state machine</p>
+      <h2 class="klaxon__title" id="klaxonTitle">Critical crowd pressure</h2>
+      <p class="klaxon__sub" id="klaxonSub">Pressure has crossed the critical threshold.</p>
+      <button class="klaxon__btn" id="klaxonDismiss" type="button" onclick="dismissCritical()">Acknowledge</button>
     </div>
   </div>
 
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.2/dist/chart.umd.min.js"></script>
-  
   <script src="{{ url_for('static', filename='main.js') }}"></script>
 </body>
 </html>

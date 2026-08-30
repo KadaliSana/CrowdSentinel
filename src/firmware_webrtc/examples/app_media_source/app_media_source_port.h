@@ -37,6 +37,21 @@ typedef struct MediaFrame {
 typedef int32_t (* OnFrameReadyToSend_t)( void * pCtx,
                                           MediaFrame_t * pFrame );
 
+/* Detection metadata produced on-device by the NN, handed to the app so it can
+ * be sent to viewers over the WebRTC data channel.
+ *
+ * The NN results are otherwise burned into the video as OSD rectangles and
+ * printed to the serial console -- neither of which a remote consumer can
+ * read as numbers. `pJson` is a NUL-terminated UTF-8 JSON object owned by the
+ * caller and only valid for the duration of the call: copy it if you need to
+ * keep it. */
+typedef int32_t (* OnMetadataReadyToSend_t)( void * pCtx,
+                                             const char * pJson,
+                                             uint32_t length );
+
+void AppMediaSourcePort_RegisterMetadataSink( OnMetadataReadyToSend_t onMetadataReadyToSendFunc,
+                                              void * pOnMetadataReadyToSendCustomContext );
+
 int32_t AppMediaSourcePort_Init( void );
 int32_t AppMediaSourcePort_Start( OnFrameReadyToSend_t onVideoFrameReadyToSendFunc,
                                   void * pOnVideoFrameReadyToSendCustomContext,
